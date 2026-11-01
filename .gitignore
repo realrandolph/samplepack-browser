@@ -53,3 +53,8 @@ __pycache__/
 
 # The audio library remains local to this workspace.
 /samples/
+
+# Debian packaging build outputs
+build/
+dist/
+vendor/**/__pycache__/

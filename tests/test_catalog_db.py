@@ -4,6 +4,7 @@ import os
 import struct
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,6 +35,26 @@ def sample_fixture(file_name: str) -> dict:
     }
 
 
+def write_test_wav(path: Path, *, channels: int = 2, width: int = 3,
+                   sample_rate: int = 48000, frames: int = 480) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(sample_rate)
+        if width == 2:
+            data = b"".join(struct.pack("<h", 2000 if index % 2 else -2000)
+                            for index in range(frames * channels))
+        elif width == 3:
+            data = b"".join(
+                ((2000 if index % 2 else -2000) & 0xFFFFFF).to_bytes(3, "little")
+                for index in range(frames * channels)
+            )
+        else:
+            raise ValueError("test helper supports 16-bit and 24-bit PCM")
+        wav.writeframes(data)
+
+
 def make_pcm24_stereo_wav() -> bytes:
     samples = [1000, -1000, 2000, -2000]
     data = b"".join((value & 0xFFFFFF).to_bytes(3, "little") for value in samples)
@@ -45,7 +66,7 @@ def make_pcm24_stereo_wav() -> bytes:
 
 class CatalogDatabaseTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="samplepack-tests-", dir="/tmp/opencode")
+        self.tempdir = tempfile.TemporaryDirectory(prefix="samplepack-tests-")
         self.db = Path(self.tempdir.name) / "catalog.sqlite3"
 
     def tearDown(self) -> None:
@@ -99,6 +120,83 @@ class CatalogDatabaseTests(unittest.TestCase):
         self.assertAlmostEqual(report["duration"], 2 / 48000)
         self.assertGreater(report["peak"], 0)
         self.assertGreater(report["rms"], 0)
+
+    def test_empty_library_initializes_without_legacy_files(self) -> None:
+        base = Path(self.tempdir.name)
+        samples = base / "samples"
+        with patch.object(catalog_db, "SAMPLES_DIR", samples), \
+                patch.object(catalog_db, "INDEX_PATH", base / "INDEX.md"), \
+                patch.object(catalog_db, "MANIFEST_PATH", base / "manifest.txt"), \
+                patch.object(catalog_db, "LEGACY_CATALOG_PATH", base / "catalog.json"), \
+                patch.object(catalog_db, "LEGACY_REVISIT_PATH", base / "revisit_list.json"):
+            self.assertEqual(catalog_db.migrate_legacy_files(self.db), 0)
+            catalog = catalog_db.load_catalog(self.db)
+            self.assertEqual(catalog["count"], 0)
+            self.assertEqual(catalog["samples"], [])
+            self.assertTrue(samples.is_dir())
+            self.assertTrue((base / "INDEX.md").is_file())
+            self.assertTrue((base / "manifest.txt").is_file())
+
+    def test_import_directory_detects_native_wav_formats(self) -> None:
+        base = Path(self.tempdir.name)
+        source = base / "incoming" / "Kicks"
+        write_test_wav(source / "mono16.wav", channels=1, width=2, sample_rate=44100)
+        write_test_wav(source / "stereo24.wav", channels=2, width=3, sample_rate=48000)
+        samples = base / "samples"
+        with patch.object(catalog_db, "SAMPLES_DIR", samples), \
+                patch.object(catalog_db, "INDEX_PATH", base / "INDEX.md"), \
+                patch.object(catalog_db, "MANIFEST_PATH", base / "manifest.txt"):
+            result = catalog_db.import_directory(source, "Kicks", self.db, write_indexes=False)
+            self.assertEqual(result["count"], 2)
+            self.assertEqual(result["category"], "kicks")
+            self.assertEqual(result["skipped"], [])
+            self.assertTrue((samples / "kicks" / "mono16.wav").is_file())
+            self.assertTrue((samples / "kicks" / "stereo24.wav").is_file())
+            catalog = catalog_db.load_catalog(self.db)
+            self.assertEqual(catalog["count"], 2)
+            mono = catalog_db.get_sample("kicks/mono16.wav", self.db)
+            stereo = catalog_db.get_sample("kicks/stereo24.wav", self.db)
+            self.assertEqual((mono["channels"], mono["bit_depth"], mono["sr"]), (1, 16, 44100))
+            self.assertEqual((stereo["channels"], stereo["bit_depth"], stereo["sr"]), (2, 24, 48000))
+
+            again = catalog_db.import_directory(source, "Kicks", self.db, write_indexes=False)
+            self.assertEqual(again["count"], 2)
+            self.assertEqual(again["total"], 4)
+            self.assertTrue((samples / "kicks" / "mono16_2.wav").is_file())
+
+    def test_import_directory_rejects_missing_or_managed_source(self) -> None:
+        base = Path(self.tempdir.name)
+        samples = base / "samples"
+        samples.mkdir()
+        with patch.object(catalog_db, "SAMPLES_DIR", samples):
+            with self.assertRaises(ValueError):
+                catalog_db.import_directory(base / "does-not-exist", path=self.db)
+            with self.assertRaises(ValueError):
+                catalog_db.import_directory(samples, path=self.db)
+
+    def test_data_and_config_directory_resolution(self) -> None:
+        base = Path(self.tempdir.name)
+        empty = {
+            "SAMPLEPACK_DATA_DIR": "", "SAMPLEPACK_DB": "",
+            "SAMPLEPACK_CONFIG_DIR": "", "XDG_DATA_HOME": str(base / "xdg-data"),
+            "XDG_CONFIG_HOME": str(base / "xdg-config"),
+        }
+        with patch.dict(os.environ, empty):
+            self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"),
+                             base / "xdg-data" / "samplepack-browser")
+            self.assertEqual(catalog_db.resolve_config_dir(),
+                             base / "xdg-config" / "samplepack-browser")
+            with patch.dict(os.environ, {"SAMPLEPACK_DATA_DIR": str(base / "explicit")}):
+                self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"), base / "explicit")
+            with patch.dict(os.environ, {"SAMPLEPACK_DB": str(base / "db" / "catalog.sqlite3")}):
+                self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"), base / "db")
+
+        checkout = base / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        with patch.dict(os.environ, empty):
+            self.assertTrue(catalog_db.is_development_tree(checkout))
+            self.assertEqual(catalog_db.resolve_data_dir(app_dir=checkout), checkout)
 
     def test_mcp_initialize_and_notifications(self) -> None:
         response = mcp_protocol.handle_message({

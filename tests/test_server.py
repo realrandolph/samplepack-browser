@@ -3,15 +3,37 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import struct
 import tempfile
 import threading
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import quote
 
 import catalog_db
 import server
+
+
+def write_test_wav(path: Path, *, channels: int = 2, width: int = 3,
+                   sample_rate: int = 48000, frames: int = 480) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(sample_rate)
+        if width == 2:
+            data = b"".join(struct.pack("<h", 2000 if index % 2 else -2000)
+                            for index in range(frames * channels))
+        elif width == 3:
+            data = b"".join(
+                ((2000 if index % 2 else -2000) & 0xFFFFFF).to_bytes(3, "little")
+                for index in range(frames * channels)
+            )
+        else:
+            raise ValueError("test helper supports 16-bit and 24-bit PCM")
+        wav.writeframes(data)
 
 
 def sample_fixture(file_name: str) -> dict:
@@ -145,7 +167,7 @@ class ServerHTTPTests(unittest.TestCase):
         self.assertNotIn("Content-Type must be application/json", json.loads(raw)["error"])
 
     def test_delete_removes_stale_catalog_row_without_wav(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="samplepack-server-", dir="/tmp/opencode") as temp:
+        with tempfile.TemporaryDirectory(prefix="samplepack-server-") as temp:
             base = Path(temp)
             db = base / "catalog.sqlite3"
             samples = base / "samples"
@@ -167,10 +189,59 @@ class ServerHTTPTests(unittest.TestCase):
             self.assertEqual(result["count"], 0)
             self.assertIsNone(catalog_db.get_sample("kicks/missing.wav", db))
 
+    def test_import_dir_endpoint_copies_and_catalogs_wavs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="samplepack-import-") as temp:
+            base = Path(temp)
+            source = base / "incoming"
+            write_test_wav(source / "mono_hit.wav", channels=1, width=2, sample_rate=44100)
+            db = base / "catalog.sqlite3"
+            samples = base / "samples"
+            body = json.dumps({"directory": str(source), "category": "hits"}).encode()
+            with patch.dict(os.environ, {"SAMPLEPACK_DB": str(db)}), \
+                    patch.object(catalog_db, "SAMPLES_DIR", samples), \
+                    patch.object(catalog_db, "INDEX_PATH", base / "INDEX.md"), \
+                    patch.object(catalog_db, "MANIFEST_PATH", base / "manifest.txt"), \
+                    patch.object(server, "SAMPLES_DIR", samples):
+                status, _headers, raw = self.request(
+                    "POST", "/api/import-dir", body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+            self.assertEqual(status, 200, raw)
+            result = json.loads(raw)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(result["category"], "hits")
+            self.assertTrue((samples / "hits" / "mono_hit.wav").is_file())
+            imported = catalog_db.get_sample("hits/mono_hit.wav", db)
+            self.assertIsNotNone(imported)
+            self.assertEqual(imported["channels"], 1)
+            self.assertEqual(imported["bit_depth"], 16)
+            self.assertEqual(imported["sr"], 44100)
+
+    def test_desktop_shortcut_endpoint_writes_executable_entry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="samplepack-desktop-") as temp:
+            home = Path(temp)
+            (home / "Desktop").mkdir()
+            with patch.dict(os.environ, {"HOME": str(home), "XDG_DESKTOP_DIR": ""}):
+                status, _headers, raw = self.request(
+                    "POST", "/api/desktop-shortcut", body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+            self.assertEqual(status, 200, raw)
+            result = json.loads(raw)
+            self.assertTrue(result["ok"])
+            target = home / "Desktop" / "samplepack-browser.desktop"
+            self.assertTrue(target.is_file())
+            self.assertTrue(os.access(target, os.X_OK))
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("[Desktop Entry]", text)
+            self.assertIn("Exec=", text)
+            self.assertEqual(Path(result["path"]), target)
+
 
 class StartupMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="samplepack-startup-", dir="/tmp/opencode")
+        self.tempdir = tempfile.TemporaryDirectory(prefix="samplepack-startup-")
         self.base = Path(self.tempdir.name)
         self.db = self.base / "catalog.sqlite3"
         self.patches = [

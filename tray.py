@@ -3,7 +3,7 @@
 
 Uses pystray with the native GTK backend and Cinnamon popup patch (matching
 realrandolph/mill) to display a reliable tray icon, auto-open the browser,
-and provide a right-click menu with 'Shutdown'.
+and provide a right-click menu with 'Create Desktop Shortcut' and 'Shutdown'.
 """
 
 from __future__ import annotations
@@ -29,7 +29,10 @@ except ImportError as exc:
     print("Run launch.sh to ensure the virtual environment is set up.", file=sys.stderr)
     sys.exit(1)
 
-from server import PACK_DIR, SamplepackHandler, SamplepackServer
+from server import (
+    PACK_DIR, SAMPLES_DIR, SamplepackHandler, SamplepackServer,
+    create_desktop_shortcut as make_desktop_shortcut,
+)
 import catalog_db
 
 APP_TITLE = "Samplepack Browser"
@@ -177,11 +180,20 @@ class SamplepackTrayController:
         self.server_thread.start()
         return True
 
+    def create_desktop_shortcut(self) -> None:
+        try:
+            result = make_desktop_shortcut()
+        except Exception as exc:
+            notify("Desktop shortcut failed", str(exc), "dialog-error")
+        else:
+            notify("Desktop shortcut created", result["path"], "application-x-executable")
+
     def build_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem("Open in Browser", lambda icon, item: open_browser(self.url), default=True),
             pystray.MenuItem("Copy URL", lambda icon, item: copy_to_clipboard(self.url)),
-            pystray.MenuItem("Open Samplepack Folder", lambda icon, item: open_folder(PACK_DIR)),
+            pystray.MenuItem("Open Samplepack Folder", lambda icon, item: open_folder(SAMPLES_DIR)),
+            pystray.MenuItem("Create Desktop Shortcut", lambda icon, item: self.create_desktop_shortcut()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Shutdown", lambda icon, item: self.shutdown()),
         )
@@ -239,13 +251,22 @@ class SamplepackTrayController:
                 pass
 
 
-def main() -> int:
-    port = DEFAULT_PORT
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except ValueError:
-            pass
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Samplepack Browser tray application")
+    parser.add_argument("port", nargs="?", type=int, help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--port", dest="port_option", type=int, help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--no-tray", "--cli", dest="cli", action="store_true",
+                        help="Run the HTTP server in the foreground without the tray")
+    args = parser.parse_args(argv)
+    port = args.port_option if args.port_option is not None else (args.port if args.port is not None else DEFAULT_PORT)
+    if not 1 <= port <= 65535:
+        print(f"invalid port: {port}", file=sys.stderr)
+        return 2
+    if args.cli:
+        import server
+        return server.main(["--port", str(port)])
 
     controller = SamplepackTrayController(port=port)
     return controller.run()

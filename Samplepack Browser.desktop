@@ -2,10 +2,12 @@
 Version=1.0
 Type=Application
 Name=Samplepack Browser
+GenericName=Sample Library Browser
 Comment=Browse, audition, edit, and manage audio samples
-Exec=/home/dolf/Documents/music/samplepack/launch.sh
-Path=/home/dolf/Documents/music/samplepack
+Exec=samplepack-browser
+TryExec=samplepack-browser
 Icon=audio-speakers
 Terminal=false
 Categories=AudioVideo;Audio;
+Keywords=sample;audio;wav;music;
 StartupNotify=true

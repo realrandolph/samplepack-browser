@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import struct
+import sys
 import tempfile
 import threading
 import wave
@@ -24,8 +25,10 @@ import catalog_db
 import mcp_protocol
 
 PACK_DIR = catalog_db.PACK_DIR
+DATA_DIR = catalog_db.DATA_DIR
 SAMPLES_DIR = catalog_db.SAMPLES_DIR
-PROVENANCE_PATH = PACK_DIR / "source" / "archival" / "provenance.json"
+PROVENANCE_PATH = DATA_DIR / "source" / "archival" / "provenance.json"
+DESKTOP_ENTRY_NAME = "samplepack-browser.desktop"
 MAX_BODY_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 MUTATION_LOCK = threading.RLock()
@@ -36,6 +39,7 @@ STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/icon.png": "ic
 JSON_MUTATION_ROUTES = frozenset({
     "/api/edit", "/api/sample", "/api/delete", "/api/revisit", "/api/flag",
     "/api/review", "/api/approve", "/api/favorite", "/api/favorites/import",
+    "/api/import-dir", "/api/desktop-shortcut",
 })
 
 
@@ -92,6 +96,72 @@ def validate_category(raw: object) -> str:
     return category
 
 
+def desktop_directory() -> Path:
+    """Return the user's desktop directory, honouring XDG when configured."""
+    configured = os.environ.get("XDG_DESKTOP_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        return Path.home() / "Desktop"
+    except RuntimeError:
+        return Path(os.environ.get("HOME") or "/tmp") / "Desktop"
+
+
+def _desktop_quote(token: str) -> str:
+    escaped = (str(token).replace("\\", "\\\\").replace('"', '\\"')
+               .replace("`", "\\`").replace("$", "\\$"))
+    return f'"{escaped}"'
+
+
+def shortcut_command() -> list[str]:
+    """Choose the installed launcher, a checkout launcher, or the tray script."""
+    installed = shutil.which(catalog_db.APP_NAME)
+    if installed:
+        return [installed]
+    launcher = PACK_DIR / "launch.sh"
+    if launcher.is_file():
+        return [str(launcher)]
+    tray_script = PACK_DIR / "tray.py"
+    if tray_script.is_file():
+        return [sys.executable, str(tray_script)]
+    return [sys.executable, str(PACK_DIR / "server.py")]
+
+
+def create_desktop_shortcut() -> dict[str, Any]:
+    """Write an executable FreeDesktop launcher to the user's Desktop folder."""
+    desktop = desktop_directory()
+    if not desktop.is_dir():
+        raise APIError(f"Desktop folder not found: {desktop}", status=404)
+    command = shortcut_command()
+    exec_line = " ".join(_desktop_quote(token) for token in command)
+    icon = PACK_DIR / "icon.png"
+    icon_value = str(icon) if icon.is_file() else "audio-x-generic"
+    content = "\n".join([
+        "[Desktop Entry]",
+        "Version=1.0",
+        "Type=Application",
+        "Name=Samplepack Browser",
+        "GenericName=Sample Library Browser",
+        "Comment=Browse, audition, and manage local WAV sample libraries",
+        f"Exec={exec_line}",
+        f"Icon={icon_value}",
+        "Terminal=false",
+        "Categories=AudioVideo;Audio;",
+        "Keywords=sample;audio;wav;music;",
+        "StartupNotify=true",
+        "",
+    ])
+    target = desktop / DESKTOP_ENTRY_NAME
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"ok": True, "path": str(target), "exec": exec_line, "icon": icon_value}
+
+
 def sample_path(file_name: object, *, must_exist: bool = True) -> tuple[str, Path]:
     relative = catalog_db.normalize_file(file_name)
     target = (SAMPLES_DIR / Path(*PurePosixPath(relative).parts)).resolve()
@@ -125,10 +195,10 @@ def static_file(route: str) -> Path | None:
     parts = PurePosixPath(decoded).parts
     if any(part in ("", ".", "..") for part in parts[1:]):
         return None
-    relative = PurePosixPath(*parts[1:])
-    if len(relative.parts) < 2 or relative.suffix.lower() != ".wav":
+    relative_parts = parts[2:]
+    if len(relative_parts) < 2 or PurePosixPath(*relative_parts).suffix.lower() != ".wav":
         return None
-    target = (PACK_DIR / Path(*relative.parts)).resolve()
+    target = (SAMPLES_DIR / Path(*relative_parts)).resolve()
     try:
         target.relative_to(SAMPLES_DIR.resolve())
     except ValueError:
@@ -585,6 +655,10 @@ class SamplepackHandler(SimpleHTTPRequestHandler):
                 if not isinstance(files, list):
                     raise APIError("'files' must be a list")
                 result = {"ok": True, "files": catalog_db.set_favorites(files, merge=True)}
+            elif route == "/api/import-dir":
+                result = self._handle_import_directory(payload)
+            elif route == "/api/desktop-shortcut":
+                result = create_desktop_shortcut()
             else:
                 self._send_json({"ok": False, "error": "not found"}, status=404)
                 return
@@ -668,6 +742,14 @@ class SamplepackHandler(SimpleHTTPRequestHandler):
         except OSError:
             pass
 
+    def _handle_import_directory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        directory = clean_text(payload.get("directory"), "directory", required=True)
+        raw_category = payload.get("category")
+        category = validate_category(raw_category) if raw_category not in (None, "") else None
+        with MUTATION_LOCK:
+            result = catalog_db.import_directory(directory, category=category)
+        return {"ok": True, **result, "total": catalog_db.load_catalog()["count"]}
+
     def _handle_add(self) -> None:
         try:
             body = _read_body(self, MAX_UPLOAD_BYTES)
@@ -739,20 +821,23 @@ class SamplepackServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def main() -> int:
-    import sys
+def main(argv: list[str] | None = None) -> int:
+    import argparse
 
-    port = 12012
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except ValueError:
-            print(f"invalid port: {sys.argv[1]}", file=sys.stderr)
-            return 2
+    parser = argparse.ArgumentParser(description="Samplepack Browser HTTP server")
+    parser.add_argument("port", nargs="?", type=int, help="HTTP port (default: 12012)")
+    parser.add_argument("--port", dest="port_option", type=int, help="HTTP port (default: 12012)")
+    parser.add_argument("--no-tray", "--cli", dest="cli", action="store_true",
+                        help="Run without the desktop tray (the server never starts one)")
+    args = parser.parse_args(argv)
+    port = args.port_option if args.port_option is not None else (args.port if args.port is not None else 12012)
+    if not 1 <= port <= 65535:
+        print(f"invalid port: {port}", file=sys.stderr)
+        return 2
     catalog_db.migrate_legacy_files()
-    catalog_db.generate_indexes()
     with SamplepackServer(("127.0.0.1", port), SamplepackHandler) as httpd:
         print(f"Serving samplepack from {PACK_DIR} at http://127.0.0.1:{port}/")
+        print(f"Library data: {DATA_DIR}")
         print(f"MCP endpoint: http://127.0.0.1:{port}/mcp")
         try:
             httpd.serve_forever()

@@ -886,7 +886,9 @@ pre.json-dump {
     <div class="stat-box"><span class="num" id="stat-favs">0</span><span class="lbl">Favorites</span></div>
     <div class="stat-box" id="stat-reviewed-box" style="cursor:pointer" title="Click to filter by reviewed & approved samples"><span class="num" id="stat-reviewed" style="color:#38ef7d">0</span><span class="lbl">Reviewed</span></div>
     <div class="stat-box" id="stat-revisit-box" style="cursor:pointer" title="Click to filter by flagged samples"><span class="num" id="stat-revisit" style="color:#ff9e58">0</span><span class="lbl">Revisit</span></div>
+    <button id="import-dir-btn" class="btn btn-sm play-btn" type="button" title="Import a directory of WAV samples from your computer" style="background:#204030;border-color:var(--acid);color:var(--acid);padding:0.5rem 0.75rem">📁 Import Folder</button>
     <button id="add-sample-btn" class="btn btn-sm play-btn" type="button" title="Add a WAV file to the local sample library" style="padding:0.5rem 0.75rem">＋ Add Sample</button>
+    <button id="desktop-shortcut-btn" class="btn btn-sm" type="button" title="Create a desktop launcher icon on ~/Desktop" style="padding:0.5rem 0.75rem">🖥 Desktop Shortcut</button>
     <button id="server-shutdown-btn" class="btn btn-sm" type="button" title="Shut down the local samplepack server process" style="border-color:#5c2424;color:#ff8080;padding:0.5rem 0.75rem">⏹ Shutdown Server</button>
   </div>
 </header>
@@ -1096,6 +1098,32 @@ pre.json-dump {
   </form>
 </dialog>
 
+<dialog id="import-dir-dialog" aria-labelledby="import-dir-title">
+  <div class="modal-head">
+    <div>
+      <h3 id="import-dir-title">📁 Import Sample Folder</h3>
+      <div style="color:var(--muted);font-size:0.76rem;margin-top:0.2rem">Scans a local directory recursively for PCM WAV files and copies them into the library.</div>
+    </div>
+    <button id="import-dir-close" class="btn btn-sm" type="button">Close (Esc)</button>
+  </div>
+  <form id="import-dir-form">
+    <div class="edit-form-grid" style="margin-top:0.8rem">
+      <label for="import-dir-path">Folder path</label>
+      <input id="import-dir-path" class="form-field" type="text" required placeholder="/home/username/Music/samples or relative folder" autocomplete="off">
+
+      <label for="import-dir-category">Category</label>
+      <input id="import-dir-category" class="form-field" type="text" placeholder="Leave blank to use folder name" autocomplete="off">
+    </div>
+    <p class="edit-hint">All WAV files in this directory will be analyzed and added to the library catalog. Non-destructive: files are copied into the managed sample directory.</p>
+    <p id="import-dir-status" class="edit-hint" style="color:var(--acid);font-weight:bold" hidden></p>
+    <p id="import-dir-error" class="del-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="import-dir-cancel" class="btn" type="button">Cancel</button>
+      <button id="import-dir-submit" class="btn play-btn" type="submit">Start Import</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="revisit-dialog" aria-labelledby="revisit-title">
   <div class="modal-head">
     <div>
@@ -1271,6 +1299,17 @@ pre.json-dump {
     editError: document.getElementById("edit-error"),
     editCancel: document.getElementById("edit-cancel"),
     editSave: document.getElementById("edit-save"),
+    importDirBtn: document.getElementById("import-dir-btn"),
+    importDirDialog: document.getElementById("import-dir-dialog"),
+    importDirClose: document.getElementById("import-dir-close"),
+    importDirCancel: document.getElementById("import-dir-cancel"),
+    importDirForm: document.getElementById("import-dir-form"),
+    importDirPath: document.getElementById("import-dir-path"),
+    importDirCategory: document.getElementById("import-dir-category"),
+    importDirStatus: document.getElementById("import-dir-status"),
+    importDirError: document.getElementById("import-dir-error"),
+    importDirSubmit: document.getElementById("import-dir-submit"),
+    desktopShortcutBtn: document.getElementById("desktop-shortcut-btn"),
     addSampleBtn: document.getElementById("add-sample-btn"),
     addDialog: document.getElementById("add-dialog"),
     addClose: document.getElementById("add-close"),
@@ -1526,6 +1565,31 @@ pre.json-dump {
       state.selectedIndex = state.filtered.findIndex((s) => s.file === state.playingFile);
     } else if (state.selectedIndex >= state.filtered.length) {
       state.selectedIndex = state.filtered.length - 1;
+    }
+
+    if (state.filtered.length === 0) {
+      if (state.samples.length === 0) {
+        els.container.className = "grid-view";
+        els.container.innerHTML = `
+          <div style="grid-column:1/-1;padding:3rem 1.5rem;text-align:center;background:var(--panel);border:1px dashed var(--edge);border-radius:6px;margin:1.5rem 0">
+            <h2 style="font-size:1.3rem;margin-bottom:0.5rem;color:var(--acid)">Your Samplepack Library is Empty</h2>
+            <p style="color:var(--muted);max-width:500px;margin:0 auto 1.5rem">Start by importing a directory of WAV samples from your computer, or adding individual samples.</p>
+            <div style="display:flex;gap:0.75rem;justify-content:center;flex-wrap:wrap">
+              <button class="btn play-btn" style="padding:0.6rem 1.2rem;background:#204030;border-color:var(--acid);color:var(--acid)" onclick="document.getElementById('import-dir-btn').click()">📁 Import Folder</button>
+              <button class="btn play-btn" style="padding:0.6rem 1.2rem" onclick="document.getElementById('add-sample-btn').click()">＋ Add Sample</button>
+              <button class="btn" style="padding:0.6rem 1.2rem" onclick="document.getElementById('desktop-shortcut-btn').click()">🖥 Create Desktop Shortcut</button>
+            </div>
+          </div>
+        `;
+        return;
+      }
+      els.container.className = "grid-view";
+      els.container.innerHTML = `
+        <div style="grid-column:1/-1;padding:3rem 1.5rem;text-align:center;color:var(--muted)">
+          No samples match the selected filters.
+        </div>
+      `;
+      return;
     }
 
     if (state.view === "table") {
@@ -2363,6 +2427,78 @@ pre.json-dump {
       els.addSubmit.textContent = "Add WAV";
     }
   });
+
+  // Directory Import & Desktop Shortcut
+  if (els.importDirBtn && els.importDirDialog) {
+    els.importDirBtn.addEventListener("click", () => {
+      els.importDirForm.reset();
+      els.importDirError.hidden = true;
+      els.importDirStatus.hidden = true;
+      els.importDirSubmit.disabled = false;
+      els.importDirSubmit.textContent = "Start Import";
+      els.importDirDialog.showModal();
+      els.importDirPath.focus();
+    });
+    els.importDirClose.addEventListener("click", () => els.importDirDialog.close());
+    els.importDirCancel.addEventListener("click", () => els.importDirDialog.close());
+    els.importDirDialog.addEventListener("click", (e) => {
+      if (e.target === els.importDirDialog) els.importDirDialog.close();
+    });
+
+    els.importDirForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      els.importDirError.hidden = true;
+      els.importDirStatus.hidden = false;
+      els.importDirStatus.textContent = "Scanning and importing samples...";
+      els.importDirSubmit.disabled = true;
+      els.importDirSubmit.textContent = "Importing…";
+
+      const payload = { directory: els.importDirPath.value.trim() };
+      const cat = els.importDirCategory.value.trim();
+      if (cat) payload.category = cat;
+
+      try {
+        const res = await fetch("./api/import-dir", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || "Directory import failed");
+        }
+        els.importDirStatus.textContent = `Imported ${data.count} samples! (Total: ${data.total})`;
+        showToast(`Imported ${data.count} samples`);
+        setTimeout(() => {
+          els.importDirDialog.close();
+          loadCatalog();
+        }, 1000);
+      } catch (err) {
+        els.importDirStatus.hidden = true;
+        els.importDirError.textContent = `Import failed: ${err.message || err}`;
+        els.importDirError.hidden = false;
+        els.importDirSubmit.disabled = false;
+        els.importDirSubmit.textContent = "Start Import";
+      }
+    });
+  }
+
+  if (els.desktopShortcutBtn) {
+    els.desktopShortcutBtn.addEventListener("click", async () => {
+      try {
+        const res = await fetch("./api/desktop-shortcut", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || "Failed to create shortcut");
+        showToast("Desktop shortcut created on ~/Desktop");
+      } catch (err) {
+        showToast(`Desktop shortcut failed: ${err.message || err}`);
+      }
+    });
+  }
 
   // Review & Revisit Functions
   function updateCounts() {

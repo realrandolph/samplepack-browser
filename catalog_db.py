@@ -6,20 +6,96 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import struct
 import tempfile
+import warnings
+import wave
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-PACK_DIR = Path(__file__).resolve().parent
-SAMPLES_DIR = PACK_DIR / "samples"
-DB_PATH = PACK_DIR / "catalog.sqlite3"
-LEGACY_CATALOG_PATH = PACK_DIR / "catalog.json"
-LEGACY_REVISIT_PATH = PACK_DIR / "revisit_list.json"
-INDEX_PATH = PACK_DIR / "INDEX.md"
-MANIFEST_PATH = PACK_DIR / "manifest.txt"
+try:  # audioop is a fast C helper; Python 3.13 removed it.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        import audioop
+except ImportError:  # pragma: no cover - exercised only on Python without audioop
+    audioop = None  # type: ignore[assignment]
+
+APP_NAME = "samplepack-browser"
+APP_DIR = Path(__file__).resolve().parent
+# Backwards-compatible name for the application/web-asset directory.
+PACK_DIR = APP_DIR
+RESERVED_CATEGORIES = frozenset({"source", "work", ".git", "samples"})
+
+
+def _home_dir() -> Path:
+    """Return the current user's home directory without embedding a username."""
+    try:
+        return Path.home()
+    except RuntimeError:
+        return Path(os.environ.get("HOME") or "/tmp")
+
+
+def xdg_data_home() -> Path:
+    configured = os.environ.get("XDG_DATA_HOME")
+    return Path(configured).expanduser() if configured else _home_dir() / ".local" / "share"
+
+
+def xdg_config_home() -> Path:
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    return Path(configured).expanduser() if configured else _home_dir() / ".config"
+
+
+def is_development_tree(app_dir: str | os.PathLike[str] | None = None) -> bool:
+    """A source checkout keeps its catalog and samples beside the application."""
+    root = Path(app_dir) if app_dir is not None else APP_DIR
+    return (root / "index.html").is_file() and (root / ".git").exists()
+
+
+def resolve_data_dir(app_dir: str | os.PathLike[str] | None = None) -> Path:
+    """Resolve the writable data directory.
+
+    Priority: ``SAMPLEPACK_DATA_DIR``, then the parent of ``SAMPLEPACK_DB``,
+    then a development checkout, then ``$XDG_DATA_HOME/samplepack-browser``.
+    """
+    configured = os.environ.get("SAMPLEPACK_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    configured_db = os.environ.get("SAMPLEPACK_DB")
+    if configured_db and configured_db != ":memory:":
+        return Path(configured_db).expanduser().parent
+    root = Path(app_dir) if app_dir is not None else APP_DIR
+    if is_development_tree(root):
+        return root
+    return xdg_data_home() / APP_NAME
+
+
+def resolve_config_dir() -> Path:
+    configured = os.environ.get("SAMPLEPACK_CONFIG_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return xdg_config_home() / APP_NAME
+
+
+DATA_DIR = resolve_data_dir()
+CONFIG_DIR = resolve_config_dir()
+SAMPLES_DIR = DATA_DIR / "samples"
+_configured_db = os.environ.get("SAMPLEPACK_DB")
+DB_PATH = Path(_configured_db).expanduser() if _configured_db else DATA_DIR / "catalog.sqlite3"
+LEGACY_CATALOG_PATH = DATA_DIR / "catalog.json"
+LEGACY_REVISIT_PATH = DATA_DIR / "revisit_list.json"
+INDEX_PATH = DATA_DIR / "INDEX.md"
+MANIFEST_PATH = DATA_DIR / "manifest.txt"
+
+
+def config_path(name: str) -> Path:
+    """Return a path inside the user config directory, creating its parent."""
+    target = resolve_config_dir() / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS app_metadata (
@@ -47,6 +123,12 @@ CREATE TABLE IF NOT EXISTS sample_state (
 """
 
 
+def ensure_directories() -> None:
+    """Create the writable data tree; an empty library is a valid library."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def database_path(path: str | os.PathLike[str] | None = None) -> Path:
     if path is not None:
         return Path(path)
@@ -68,6 +150,87 @@ def connect(path: str | os.PathLike[str] | None = None) -> sqlite3.Connection:
 
 def now_string() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _block_peak_rms(block: bytes, width: int) -> tuple[int, int, int]:
+    """Return peak, sum of signed sample squares, and sample count for one block."""
+    peak = 0
+    square_sum = 0
+    count = 0
+    if width == 1:
+        values: Iterable[int] = (value - 128 for value in block)
+    elif width == 2:
+        values = (value for (value,) in struct.iter_unpack("<h", block))
+    elif width == 3:
+        values = (
+            int.from_bytes(block[offset:offset + 3], "little", signed=True)
+            for offset in range(0, len(block) - 2, 3)
+        )
+    else:
+        values = (value for (value,) in struct.iter_unpack("<i", block))
+    for value in values:
+        magnitude = abs(value)
+        if magnitude > peak:
+            peak = magnitude
+        square_sum += value * value
+        count += 1
+    return peak, square_sum, count
+
+
+def analyze_wav_file(source: str | os.PathLike[str]) -> dict[str, Any]:
+    """Measure a PCM WAV at its native channel count, bit depth, and sample rate."""
+    path = Path(source)
+    try:
+        with wave.open(str(path), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_rate = wav.getframerate()
+            width = wav.getsampwidth()
+            frames = wav.getnframes()
+            if wav.getcomptype() != "NONE":
+                raise ValueError("WAV must use uncompressed PCM")
+            if channels < 1 or sample_rate < 1:
+                raise ValueError("WAV has an invalid channel count or sample rate")
+            if width not in (1, 2, 3, 4):
+                raise ValueError(f"unsupported PCM sample width: {width * 8}-bit")
+            if frames <= 0:
+                raise ValueError("WAV contains no audio frames")
+            peak = 0
+            square_sum = 0
+            sample_count = 0
+            while True:
+                block = wav.readframes(65536)
+                if not block:
+                    break
+                if audioop is not None:
+                    block_peak = audioop.max(block, width)
+                    block_rms = audioop.rms(block, width)
+                    block_count = len(block) // width
+                    square_sum += block_rms * block_rms * block_count
+                    sample_count += block_count
+                    peak = max(peak, block_peak)
+                else:
+                    block_peak, block_square, block_count = _block_peak_rms(block, width)
+                    peak = max(peak, block_peak)
+                    square_sum += block_square
+                    sample_count += block_count
+    except (wave.Error, EOFError, OSError) as exc:
+        raise ValueError(f"could not read WAV: {exc}") from None
+    if sample_count == 0:
+        raise ValueError("WAV contains no audio frames")
+    full_scale = float(1 << (8 * width - 1))
+    peak_linear = peak / full_scale
+    rms_linear = (square_sum / sample_count) ** 0.5 / full_scale
+    return {
+        "duration": frames / sample_rate,
+        "sr": sample_rate,
+        "channels": channels,
+        "bit_depth": width * 8,
+        "peak": round(peak_linear, 6),
+        "rms": round(rms_linear, 6),
+        "crest": round(peak_linear / rms_linear, 2) if rms_linear else None,
+        "centroid_hz": None,
+        "pitch": None,
+    }
 
 
 def normalize_file(value: object) -> str:
@@ -280,7 +443,7 @@ def load_catalog(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
         "description": metadata.get("description", "Production sample library."),
         "format": metadata.get("format", "WAV PCM_24 stereo 48000 Hz"),
         "updated": metadata.get("updated", now_string()[:10]),
-        "root": str(PACK_DIR),
+        "root": str(DATA_DIR),
         "count": len(samples),
         "categories": categories,
         "roles": {key: roles[key] for key in sorted(roles)},
@@ -322,6 +485,144 @@ def add_sample(sample: dict[str, Any], path: str | os.PathLike[str] | None = Non
     finally:
         conn.close()
     generate_indexes(path)
+
+
+def _category_slug(value: object) -> str:
+    category = re.sub(r"[^a-z0-9_-]+", "_", str(value or "").casefold()).strip("_")
+    if not category or category in RESERVED_CATEGORIES:
+        return "imported"
+    return category
+
+
+def _unique_sample_path(conn: sqlite3.Connection, category: str, stem: str) -> tuple[str, Path]:
+    base = re.sub(r"[\\/\x00]+", "_", stem).strip() or "sample"
+    if base in (".", ".."):
+        base = "sample"
+    index = 1
+    while True:
+        suffix = "" if index == 1 else f"_{index}"
+        file_name = normalize_file(f"{category}/{base}{suffix}.wav")
+        destination = SAMPLES_DIR / Path(*PurePosixPath(file_name).parts)
+        if not destination.exists() and conn.execute(
+            "SELECT 1 FROM samples WHERE file=?", (file_name,)
+        ).fetchone() is None:
+            return file_name, destination
+        index += 1
+
+
+def import_directory(directory: str | os.PathLike[str], category: str | None = None,
+                     path: str | os.PathLike[str] | None = None,
+                     *, write_indexes: bool = True) -> dict[str, Any]:
+    """Copy every WAV below *directory* into the managed library and catalog it.
+
+    The source may contain mono or stereo PCM WAVs at any sample rate and
+    8/16/24/32-bit depth. Files that cannot be read are reported in ``skipped``
+    instead of aborting the whole import.
+    """
+    source_dir = Path(directory).expanduser()
+    if not source_dir.is_dir():
+        raise ValueError(f"not a directory: {source_dir}")
+    source_dir = source_dir.resolve()
+    samples_root = SAMPLES_DIR.resolve()
+    if source_dir == samples_root or samples_root in source_dir.parents:
+        raise ValueError("source directory is already inside the managed samples library")
+
+    category_name = _category_slug(category) if category is not None else _category_slug(source_dir.name)
+    destination_dir = SAMPLES_DIR / category_name
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    sources = sorted(
+        (item for item in source_dir.rglob("*")
+         if item.is_file() and item.suffix.casefold() == ".wav"),
+        key=lambda item: str(item).casefold(),
+    )
+
+    imported: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    copied: list[Path] = []
+    conn = connect(path)
+    try:
+        with conn:
+            for source_file in sources:
+                destination: Path | None = None
+                temporary: Path | None = None
+                try:
+                    stats = analyze_wav_file(source_file)
+                    file_name, destination = _unique_sample_path(conn, category_name, source_file.stem)
+                    temporary = destination.with_name(f".{destination.name}.importing")
+                    shutil.copyfile(source_file, temporary)
+                    os.replace(temporary, destination)
+                    copied.append(destination)
+                    sample = {
+                        "file": file_name,
+                        "name": source_file.stem,
+                        "category": category_name,
+                        "tags": [],
+                        **stats,
+                        "dry_processed": "dry",
+                        "parent": None,
+                        "processing": ["directory import"],
+                        "provenance": {
+                            "type": "directory_import",
+                            "source_path": str(source_file),
+                            "original_filename": source_file.name,
+                            "license": "Unknown — verify rights before distribution",
+                        },
+                        "license": "Unknown — verify rights before distribution",
+                        "description": "",
+                        "source_window": None,
+                        "role": "",
+                        "use": [],
+                        "suggested_use": "",
+                        "transcript": None,
+                        "reviewed": False,
+                        "reviewed_date": None,
+                        "revisit": True,
+                        "revisit_reason": "New directory import: verify source, license, and audio quality",
+                        "revisit_date": now_string(),
+                    }
+                    _store_sample(conn, sample)
+                    imported.append({
+                        "file": file_name,
+                        "name": source_file.stem,
+                        "duration": stats["duration"],
+                        "sr": stats["sr"],
+                        "channels": stats["channels"],
+                        "bit_depth": stats["bit_depth"],
+                        "peak": stats["peak"],
+                        "rms": stats["rms"],
+                        "crest": stats["crest"],
+                    })
+                except (OSError, ValueError, wave.Error, EOFError) as exc:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                    if destination is not None:
+                        destination.unlink(missing_ok=True)
+                        if destination in copied:
+                            copied.remove(destination)
+                    skipped.append({"path": str(source_file), "reason": str(exc)})
+            if imported:
+                conn.execute(
+                    "INSERT INTO app_metadata(key, value) VALUES ('updated', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (now_string()[:10],),
+                )
+    except BaseException:
+        for destination in copied:
+            destination.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
+
+    if imported and write_indexes:
+        generate_indexes(path)
+    return {
+        "directory": str(source_dir),
+        "category": category_name,
+        "count": len(imported),
+        "imported": imported,
+        "skipped": skipped,
+        "total": catalog_db_count(path),
+    }
 
 
 def update_sample(old_file: str, sample: dict[str, Any],
@@ -481,7 +782,7 @@ def render_index(catalog: dict[str, Any]) -> str:
     lines = [
         "# Samplepack index (generated from catalog.sqlite3)",
         "",
-        f"Root: `{PACK_DIR}`",
+        f"Root: `{DATA_DIR}`",
         f"Audio root: `{SAMPLES_DIR}`",
         f"Format: {catalog.get('format', 'WAV PCM_24 stereo 48000 Hz')}",
         f"Count: **{len(samples)}** production files.",
@@ -542,6 +843,7 @@ def generate_indexes(path: str | os.PathLike[str] | None = None) -> None:
 
 def migrate_legacy_files(path: str | os.PathLike[str] | None = None) -> int:
     """Import first, then remove ignored legacy JSON state once the DB is verified."""
+    ensure_directories()
     had_legacy_catalog = LEGACY_CATALOG_PATH.exists()
     had_legacy_revisit = LEGACY_REVISIT_PATH.exists()
     count = migrate_legacy(path)
