@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import struct
+import sys
 import tempfile
 import unittest
 import wave
@@ -195,6 +196,54 @@ class CatalogDatabaseTests(unittest.TestCase):
         (checkout / ".git").mkdir(parents=True)
         (checkout / "index.html").write_text("<!doctype html>", encoding="utf-8")
         with patch.dict(os.environ, empty):
+            self.assertTrue(catalog_db.is_development_tree(checkout))
+            self.assertEqual(catalog_db.resolve_data_dir(app_dir=checkout), checkout)
+
+    def test_windows_directory_resolution_uses_appdata_locations(self) -> None:
+        base = Path(self.tempdir.name)
+        local = base / "LocalAppData"
+        roaming = base / "RoamingAppData"
+        env = {
+            "SAMPLEPACK_DATA_DIR": "", "SAMPLEPACK_DB": "",
+            "SAMPLEPACK_CONFIG_DIR": "",
+            "LOCALAPPDATA": str(local), "APPDATA": str(roaming),
+            "XDG_DATA_HOME": str(base / "xdg-data"),
+            "XDG_CONFIG_HOME": str(base / "xdg-config"),
+        }
+        with patch.dict(os.environ, env), patch.object(sys, "platform", "win32"):
+            self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"),
+                             local / "samplepack-browser")
+            self.assertEqual(catalog_db.resolve_config_dir(),
+                             roaming / "samplepack-browser")
+            self.assertEqual(catalog_db.config_path("state.json"),
+                             roaming / "samplepack-browser" / "state.json")
+
+            with patch.dict(os.environ, {"SAMPLEPACK_DATA_DIR": str(base / "explicit")}):
+                self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"), base / "explicit")
+            with patch.dict(os.environ, {"SAMPLEPACK_DB": str(base / "db" / "catalog.sqlite3")}):
+                self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"), base / "db")
+            with patch.dict(os.environ, {"SAMPLEPACK_CONFIG_DIR": str(base / "config")}):
+                self.assertEqual(catalog_db.resolve_config_dir(), base / "config")
+
+        fallback_env = dict(env, LOCALAPPDATA="", APPDATA="")
+        with patch.dict(os.environ, fallback_env), \
+                patch.object(sys, "platform", "win32"), \
+                patch.object(catalog_db, "_home_dir", return_value=base / "home"):
+            self.assertEqual(catalog_db.resolve_data_dir(app_dir=base / "app"),
+                             base / "home" / "AppData" / "Local" / "samplepack-browser")
+            self.assertEqual(catalog_db.resolve_config_dir(),
+                             base / "home" / "AppData" / "Roaming" / "samplepack-browser")
+
+    def test_windows_resolution_keeps_development_tree(self) -> None:
+        base = Path(self.tempdir.name)
+        checkout = base / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        env = {
+            "SAMPLEPACK_DATA_DIR": "", "SAMPLEPACK_DB": "", "SAMPLEPACK_CONFIG_DIR": "",
+            "LOCALAPPDATA": str(base / "LocalAppData"), "APPDATA": str(base / "RoamingAppData"),
+        }
+        with patch.dict(os.environ, env), patch.object(sys, "platform", "win32"):
             self.assertTrue(catalog_db.is_development_tree(checkout))
             self.assertEqual(catalog_db.resolve_data_dir(app_dir=checkout), checkout)
 

@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import struct
+import sys
 import tempfile
 import warnings
 import wave
@@ -49,6 +50,27 @@ def xdg_config_home() -> Path:
     return Path(configured).expanduser() if configured else _home_dir() / ".config"
 
 
+def _is_windows() -> bool:
+    """True when running on Windows. Read at call time so tests can mock it."""
+    return sys.platform == "win32"
+
+
+def windows_data_dir() -> Path:
+    """Return ``%LOCALAPPDATA%\\samplepack-browser`` with a home-relative fallback."""
+    configured = os.environ.get("LOCALAPPDATA")
+    if configured:
+        return Path(configured).expanduser() / APP_NAME
+    return _home_dir() / "AppData" / "Local" / APP_NAME
+
+
+def windows_config_dir() -> Path:
+    """Return ``%APPDATA%\\samplepack-browser`` with a home-relative fallback."""
+    configured = os.environ.get("APPDATA")
+    if configured:
+        return Path(configured).expanduser() / APP_NAME
+    return _home_dir() / "AppData" / "Roaming" / APP_NAME
+
+
 def is_development_tree(app_dir: str | os.PathLike[str] | None = None) -> bool:
     """A source checkout keeps its catalog and samples beside the application."""
     root = Path(app_dir) if app_dir is not None else APP_DIR
@@ -59,7 +81,9 @@ def resolve_data_dir(app_dir: str | os.PathLike[str] | None = None) -> Path:
     """Resolve the writable data directory.
 
     Priority: ``SAMPLEPACK_DATA_DIR``, then the parent of ``SAMPLEPACK_DB``,
-    then a development checkout, then ``$XDG_DATA_HOME/samplepack-browser``.
+    then a development checkout, then the platform location: on Windows
+    ``%LOCALAPPDATA%\\samplepack-browser`` and elsewhere
+    ``$XDG_DATA_HOME/samplepack-browser``.
     """
     configured = os.environ.get("SAMPLEPACK_DATA_DIR")
     if configured:
@@ -70,13 +94,18 @@ def resolve_data_dir(app_dir: str | os.PathLike[str] | None = None) -> Path:
     root = Path(app_dir) if app_dir is not None else APP_DIR
     if is_development_tree(root):
         return root
+    if _is_windows():
+        return windows_data_dir()
     return xdg_data_home() / APP_NAME
 
 
 def resolve_config_dir() -> Path:
+    """Resolve the config directory, honouring ``SAMPLEPACK_CONFIG_DIR`` first."""
     configured = os.environ.get("SAMPLEPACK_CONFIG_DIR")
     if configured:
         return Path(configured).expanduser()
+    if _is_windows():
+        return windows_config_dir()
     return xdg_config_home() / APP_NAME
 
 

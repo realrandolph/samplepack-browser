@@ -51,6 +51,7 @@ By default, the browser launches in GUI mode: it initializes the background HTTP
 
 - A source checkout keeps `catalog.sqlite3`, `samples/`, and generated indexes beside the application code.
 - An installed copy (for example under `/usr/lib/samplepack-browser`) stores user data at `$XDG_DATA_HOME/samplepack-browser` (default `~/.local/share/samplepack-browser`) and configuration at `$XDG_CONFIG_HOME/samplepack-browser` (default `~/.config/samplepack-browser`).
+- On Windows, an installed copy stores user data at `%LOCALAPPDATA%\samplepack-browser` and configuration at `%APPDATA%\samplepack-browser`.
 - `SAMPLEPACK_DATA_DIR` overrides the data directory. `SAMPLEPACK_DB` overrides the database path and places `samples/` beside it. `SAMPLEPACK_CONFIG_DIR` overrides the configuration directory.
 
 #### Headless / Terminal Mode

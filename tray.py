@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""System tray application for Samplepack Browser on Linux Mint Cinnamon.
+"""System tray application for Samplepack Browser.
 
-Uses pystray with the native GTK backend and Cinnamon popup patch (matching
-realrandolph/mill) to display a reliable tray icon, auto-open the browser,
-and provide a right-click menu with 'Create Desktop Shortcut' and 'Shutdown'.
+Uses pystray with its native GTK backend and Cinnamon popup patch on Linux,
+and pystray's native Win32 backend on Windows. Provides a tray icon, opens the
+browser, and offers 'Create Desktop Shortcut' and 'Shutdown' in its menu.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
@@ -17,8 +18,11 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-# Force pystray to use GTK on Linux Mint / Cinnamon
-if "PYSTRAY_BACKEND" not in os.environ:
+# Force pystray to use GTK on Linux Mint / Cinnamon. Windows uses pystray's
+# native Win32 backend, so the environment override and GTK patch stay off.
+_IS_WINDOWS = sys.platform == "win32"
+
+if not _IS_WINDOWS and "PYSTRAY_BACKEND" not in os.environ:
     os.environ["PYSTRAY_BACKEND"] = "gtk"
 
 try:
@@ -66,7 +70,8 @@ def _install_gtk_popup_patch(icon_class) -> bool:
     return True
 
 
-_install_gtk_popup_patch(pystray.Icon)
+if not _IS_WINDOWS:
+    _install_gtk_popup_patch(pystray.Icon)
 
 
 def create_tray_icon_image(size: int = 64) -> Image.Image:
@@ -94,8 +99,50 @@ def is_server_already_running(port: int) -> bool:
         return False
 
 
-def notify(summary: str, body: str, icon_name: str = "audio-speakers") -> None:
-    """Send a desktop notification via notify-send if available."""
+def _powershell_quote(value: str) -> str:
+    """Quote one PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _windows_toast_classic(summary: str, body: str) -> bool:
+    """Show a Windows toast through the WinRT notification APIs via PowerShell."""
+    script = ";".join([
+        "$ErrorActionPreference = 'Stop'",
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null",
+        "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+        "[Windows.UI.Notifications.ToastTemplateType]::ToastText02)",
+        "$texts = $template.GetElementsByTagName('text')",
+        f"$texts.Item(0).AppendChild($template.CreateTextNode({_powershell_quote(summary)})) | Out-Null",
+        f"$texts.Item(1).AppendChild($template.CreateTextNode({_powershell_quote(body)})) | Out-Null",
+        "$toast = [Windows.UI.Notifications.ToastNotification]::new($template)",
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+        f"{_powershell_quote(APP_TITLE)}).Show($toast)",
+    ])
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
+def notify(summary: str, body: str, icon_name: str = "audio-speakers",
+           icon: pystray.Icon | None = None) -> None:
+    """Send a desktop notification using the platform's native mechanism."""
+    if sys.platform == "win32":
+        if icon is not None:
+            try:
+                icon.notify(body, summary)
+                return
+            except Exception:
+                pass
+        _windows_toast_classic(summary, body)
+        return
     try:
         subprocess.run(
             ["notify-send", "-a", APP_TITLE, "-i", icon_name, summary, body],
@@ -107,7 +154,18 @@ def notify(summary: str, body: str, icon_name: str = "audio-speakers") -> None:
 
 
 def open_browser(url: str) -> None:
-    """Open URL in default web browser using xdg-open or webbrowser module."""
+    """Open a URL in the default browser on the current platform."""
+    if sys.platform == "win32":
+        try:
+            if webbrowser.open(url):
+                return
+        except Exception:
+            pass
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return
     try:
         subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -115,20 +173,49 @@ def open_browser(url: str) -> None:
 
 
 def open_folder(path: Path) -> None:
-    """Open folder in default file manager (Nemo)."""
+    """Open a folder in the platform file manager."""
+    if sys.platform == "win32":
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(["explorer", str(path)])
+        except Exception:
+            pass
+        return
     try:
         subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
-def copy_to_clipboard(text: str) -> None:
-    """Copy text to system clipboard via xclip or xsel if available."""
+def copy_to_clipboard(text: str, icon: pystray.Icon | None = None) -> None:
+    """Copy text to the system clipboard using the platform's own tools."""
+    if sys.platform == "win32":
+        quoted = _powershell_quote(text)
+        commands = [
+            (["powershell", "-NoProfile", "-NonInteractive", "-Command",
+              f"Set-Clipboard -Value {quoted}"], None),
+            (["clip"], text.encode("utf-8")),
+        ]
+        for command, payload in commands:
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.PIPE if payload else None)
+                process.communicate(payload, timeout=3.0)
+            except Exception:
+                continue
+            if process.returncode == 0:
+                notify("Copied URL to Clipboard", text, "edit-copy", icon=icon)
+                return
+        return
+
     for tool in [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
         try:
             p = subprocess.Popen(tool, stdin=subprocess.PIPE)
             p.communicate(text.encode("utf-8"), timeout=1.0)
-            notify("Copied URL to Clipboard", text, "edit-copy")
+            notify("Copied URL to Clipboard", text, "edit-copy", icon=icon)
             return
         except Exception:
             continue
@@ -152,6 +239,7 @@ class SamplepackTrayController:
                 "Samplepack Browser already active",
                 f"Opening existing browser at {self.url}",
                 "audio-speakers",
+                icon=self.icon,
             )
             open_browser(self.url)
             return False
@@ -159,7 +247,8 @@ class SamplepackTrayController:
         try:
             self.httpd = SamplepackServer(("127.0.0.1", self.port), SamplepackHandler)
         except OSError as err:
-            if err.errno == 98:  # Address already in use
+            # Winsock reports WSAEADDRINUSE (10048) where POSIX reports EADDRINUSE.
+            if err.errno in (errno.EADDRINUSE, 10048):
                 # Try finding next port
                 for p in range(self.port + 1, self.port + 10):
                     try:
@@ -170,7 +259,8 @@ class SamplepackTrayController:
                     except OSError:
                         continue
             if not self.httpd:
-                notify("Startup Error", f"Could not bind to port {self.port}", "dialog-error")
+                notify("Startup Error", f"Could not bind to port {self.port}", "dialog-error",
+                       icon=self.icon)
                 return False
 
         # Link web UI /api/shutdown to tray shutdown
@@ -182,16 +272,17 @@ class SamplepackTrayController:
 
     def create_desktop_shortcut(self) -> None:
         try:
-            result = make_desktop_shortcut()
+            result = make_desktop_shortcut(url=self.url)
         except Exception as exc:
-            notify("Desktop shortcut failed", str(exc), "dialog-error")
+            notify("Desktop shortcut failed", str(exc), "dialog-error", icon=self.icon)
         else:
-            notify("Desktop shortcut created", result["path"], "application-x-executable")
+            notify("Desktop shortcut created", result["path"], "application-x-executable",
+                   icon=self.icon)
 
     def build_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem("Open in Browser", lambda icon, item: open_browser(self.url), default=True),
-            pystray.MenuItem("Copy URL", lambda icon, item: copy_to_clipboard(self.url)),
+            pystray.MenuItem("Copy URL", lambda icon, item: copy_to_clipboard(self.url, icon=self.icon)),
             pystray.MenuItem("Open Samplepack Folder", lambda icon, item: open_folder(SAMPLES_DIR)),
             pystray.MenuItem("Create Desktop Shortcut", lambda icon, item: self.create_desktop_shortcut()),
             pystray.Menu.SEPARATOR,
@@ -213,6 +304,7 @@ class SamplepackTrayController:
             "Samplepack Browser is running",
             f"Active at {self.url}\nRight-click the panel icon for menu or Shutdown.",
             "audio-speakers",
+            icon=self.icon,
         )
         open_browser(self.url)
 
@@ -236,7 +328,8 @@ class SamplepackTrayController:
                 return
             self._is_shutting_down = True
 
-        notify("Samplepack Browser stopped", "The server has been shut down.", "process-stop")
+        notify("Samplepack Browser stopped", "The server has been shut down.", "process-stop",
+               icon=self.icon)
 
         if self.icon:
             try:

@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -237,6 +238,55 @@ class ServerHTTPTests(unittest.TestCase):
             self.assertIn("[Desktop Entry]", text)
             self.assertIn("Exec=", text)
             self.assertEqual(Path(result["path"]), target)
+
+    def test_windows_desktop_directory_uses_user_profile(self) -> None:
+        with patch.object(sys, "platform", "win32"), \
+                patch.dict(os.environ, {"USERPROFILE": r"C:\Users\Example"}):
+            self.assertEqual(server.desktop_directory(), Path(r"C:\Users\Example") / "Desktop")
+
+    def test_windows_desktop_shortcut_writes_internet_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="samplepack-desktop-win-") as temp:
+            desktop = Path(temp) / "Desktop"
+            desktop.mkdir()
+            with patch.object(sys, "platform", "win32"), \
+                    patch.object(server, "desktop_directory", return_value=desktop), \
+                    patch.object(server, "windows_launcher_target", return_value=None):
+                result = server.create_desktop_shortcut("http://127.0.0.1:12012/")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["kind"], "url")
+            target = desktop / "Samplepack Browser.url"
+            self.assertEqual(Path(result["path"]), target)
+            self.assertTrue(target.is_file())
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("[InternetShortcut]", text)
+            self.assertIn("URL=http://127.0.0.1:12012/", text)
+            self.assertIn("IconFile=", text)
+            self.assertFalse((desktop / "samplepack-browser.desktop").exists())
+
+    def test_windows_desktop_shortcut_prefers_lnk_when_launcher_installed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="samplepack-desktop-lnk-") as temp:
+            desktop = Path(temp) / "Desktop"
+            desktop.mkdir()
+            launcher = Path(temp) / "samplepack-browser.exe"
+            launcher.write_text("", encoding="utf-8")
+
+            def fake_lnk(desktop_dir: Path, target: Path, arguments: str) -> Path | None:
+                shortcut = desktop_dir / "Samplepack Browser.lnk"
+                shortcut.write_text(f"{target}\n{arguments}", encoding="utf-8")
+                return shortcut
+
+            with patch.object(sys, "platform", "win32"), \
+                    patch.object(server, "desktop_directory", return_value=desktop), \
+                    patch.object(server, "windows_launcher_target",
+                                 return_value=(launcher, "")), \
+                    patch.object(server, "_write_windows_lnk", side_effect=fake_lnk):
+                result = server.create_desktop_shortcut("http://127.0.0.1:12012/")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["kind"], "lnk")
+            target = desktop / "Samplepack Browser.lnk"
+            self.assertEqual(Path(result["path"]), target)
+            self.assertTrue(target.is_file())
+            self.assertFalse((desktop / "Samplepack Browser.url").exists())
 
 
 class StartupMigrationTests(unittest.TestCase):

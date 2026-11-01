@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,7 +29,10 @@ PACK_DIR = catalog_db.PACK_DIR
 DATA_DIR = catalog_db.DATA_DIR
 SAMPLES_DIR = catalog_db.SAMPLES_DIR
 PROVENANCE_PATH = DATA_DIR / "source" / "archival" / "provenance.json"
+DEFAULT_PORT = 12012
 DESKTOP_ENTRY_NAME = "samplepack-browser.desktop"
+WINDOWS_URL_SHORTCUT_NAME = "Samplepack Browser.url"
+WINDOWS_LNK_SHORTCUT_NAME = "Samplepack Browser.lnk"
 MAX_BODY_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 MUTATION_LOCK = threading.RLock()
@@ -97,7 +101,15 @@ def validate_category(raw: object) -> str:
 
 
 def desktop_directory() -> Path:
-    """Return the user's desktop directory, honouring XDG when configured."""
+    """Return the user's desktop directory for the current platform."""
+    if sys.platform == "win32":
+        profile = os.environ.get("USERPROFILE")
+        if profile:
+            return Path(profile).expanduser() / "Desktop"
+        try:
+            return Path.home() / "Desktop"
+        except RuntimeError:
+            return Path(os.environ.get("HOME") or ".") / "Desktop"
     configured = os.environ.get("XDG_DESKTOP_DIR")
     if configured:
         return Path(configured).expanduser()
@@ -105,6 +117,11 @@ def desktop_directory() -> Path:
         return Path.home() / "Desktop"
     except RuntimeError:
         return Path(os.environ.get("HOME") or "/tmp") / "Desktop"
+
+
+def _powershell_quote(value: str) -> str:
+    """Quote one PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _desktop_quote(token: str) -> str:
@@ -127,11 +144,103 @@ def shortcut_command() -> list[str]:
     return [sys.executable, str(PACK_DIR / "server.py")]
 
 
-def create_desktop_shortcut() -> dict[str, Any]:
-    """Write an executable FreeDesktop launcher to the user's Desktop folder."""
+def windows_launcher_target() -> tuple[Path, str] | None:
+    """Return an installed Windows launcher and its arguments, when present."""
+    for name in (f"{catalog_db.APP_NAME}.exe", f"{catalog_db.APP_NAME}.cmd",
+                 f"{catalog_db.APP_NAME}.bat"):
+        installed = shutil.which(name)
+        if installed:
+            return Path(installed), ""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    tray_script = PACK_DIR / "tray.py"
+    if pythonw.is_file() and tray_script.is_file():
+        return pythonw, f'"{tray_script}"'
+    if tray_script.is_file():
+        return Path(sys.executable), f'"{tray_script}"'
+    if (PACK_DIR / "server.py").is_file():
+        return Path(sys.executable), '"{}"'.format(PACK_DIR / "server.py")
+    return None
+
+
+def _write_windows_shortcut_file(desktop: Path, url: str) -> Path:
+    """Write a plain-text InternetShortcut (``.url``) that opens the web UI."""
+    icon = PACK_DIR / "icon.png"
+    lines = ["[InternetShortcut]", f"URL={url}"]
+    if icon.is_file():
+        lines.extend([f"IconFile={icon}", "IconIndex=0"])
+    target = desktop / WINDOWS_URL_SHORTCUT_NAME
+    target.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    return target
+
+
+def _write_windows_lnk(desktop: Path, target: Path, arguments: str) -> Path | None:
+    """Create a ``.lnk`` shortcut through WScript.Shell when PowerShell exists."""
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        return None
+    shortcut = desktop / WINDOWS_LNK_SHORTCUT_NAME
+    icon = PACK_DIR / "icon.png"
+    description = "Browse, audition, and manage local WAV sample libraries"
+    script = ";".join([
+        "$ErrorActionPreference = 'Stop'",
+        "$shell = New-Object -ComObject WScript.Shell",
+        f"$shortcut = $shell.CreateShortcut({_powershell_quote(str(shortcut))})",
+        f"$shortcut.TargetPath = {_powershell_quote(str(target))}",
+        f"$shortcut.Arguments = {_powershell_quote(arguments)}",
+        f"$shortcut.WorkingDirectory = {_powershell_quote(str(PACK_DIR))}",
+        f"$shortcut.Description = {_powershell_quote(description)}",
+    ])
+    if icon.is_file():
+        script += f";$shortcut.IconLocation = {_powershell_quote(str(icon))}"
+    script += ";$shortcut.Save()"
+    try:
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0 or not shortcut.is_file():
+        return None
+    return shortcut
+
+
+def create_windows_shortcut(desktop: Path, url: str) -> dict[str, Any]:
+    """Create a Windows shortcut that opens the browser UI."""
+    launcher = windows_launcher_target()
+    if launcher is not None:
+        target, arguments = launcher
+        shortcut = _write_windows_lnk(desktop, target, arguments)
+        if shortcut is not None:
+            return {
+                "ok": True,
+                "path": str(shortcut),
+                "kind": "lnk",
+                "target": str(target),
+                "arguments": arguments,
+                "url": url,
+                "icon": str(PACK_DIR / "icon.png"),
+            }
+    shortcut = _write_windows_shortcut_file(desktop, url)
+    return {
+        "ok": True,
+        "path": str(shortcut),
+        "kind": "url",
+        "url": url,
+        "icon": str(PACK_DIR / "icon.png"),
+    }
+
+
+def create_desktop_shortcut(url: str | None = None) -> dict[str, Any]:
+    """Write a desktop shortcut for the running browser."""
     desktop = desktop_directory()
     if not desktop.is_dir():
         raise APIError(f"Desktop folder not found: {desktop}", status=404)
+    target_url = url or f"http://127.0.0.1:{DEFAULT_PORT}/"
+    if sys.platform == "win32":
+        return create_windows_shortcut(desktop, target_url)
     command = shortcut_command()
     exec_line = " ".join(_desktop_quote(token) for token in command)
     icon = PACK_DIR / "icon.png"
@@ -658,7 +767,9 @@ class SamplepackHandler(SimpleHTTPRequestHandler):
             elif route == "/api/import-dir":
                 result = self._handle_import_directory(payload)
             elif route == "/api/desktop-shortcut":
-                result = create_desktop_shortcut()
+                result = create_desktop_shortcut(
+                    f"http://127.0.0.1:{self.server.server_address[1]}/"
+                )
             else:
                 self._send_json({"ok": False, "error": "not found"}, status=404)
                 return
@@ -825,12 +936,12 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Samplepack Browser HTTP server")
-    parser.add_argument("port", nargs="?", type=int, help="HTTP port (default: 12012)")
-    parser.add_argument("--port", dest="port_option", type=int, help="HTTP port (default: 12012)")
+    parser.add_argument("port", nargs="?", type=int, help=f"HTTP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--port", dest="port_option", type=int, help=f"HTTP port (default: {DEFAULT_PORT})")
     parser.add_argument("--no-tray", "--cli", dest="cli", action="store_true",
                         help="Run without the desktop tray (the server never starts one)")
     args = parser.parse_args(argv)
-    port = args.port_option if args.port_option is not None else (args.port if args.port is not None else 12012)
+    port = args.port_option if args.port_option is not None else (args.port if args.port is not None else DEFAULT_PORT)
     if not 1 <= port <= 65535:
         print(f"invalid port: {port}", file=sys.stderr)
         return 2
