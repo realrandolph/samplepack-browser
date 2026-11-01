@@ -15,7 +15,9 @@ Samplepack Browser provides an interface for electronic music producers and soun
 - **In-Browser Sample Management**:
   - **Inline Metadata Editing**: Rename samples, assign categories, roles, suggested uses, tags, transcripts, and descriptions. Changing a category physically moves the audio file on disk and updates indexes atomically.
   - **Sample Deletion**: Red `✕` action button with confirmation dialog and atomic deletion from disk and metadata catalogs.
-  - **🚩 Revisit & Review System**: Flag samples that need remediation (e.g. truncated tails, miscategorizations, level issues) with preset tags or custom notes. Filter exclusively by flagged items, and export/copy the review list.
+  - **👍 Thumbs Up & Approved Marking**: Mark samples as reviewed and accepted directly next to the waveform or on each card/row, displaying a green checkmark (`✓`) and badge.
+  - **👎 Thumbs Down & Action Menu**: Quick triage dialog prompting whether to permanently delete the sample, flag it for revisit with notes, edit its metadata, or do nothing.
+  - **🚩 Revisit & Review System**: Flag samples that need remediation (e.g. truncated tails, miscategorizations, level issues) with preset tags or custom notes. Filter exclusively by flagged or approved items, and export/copy the review list.
 - **Native Cinnamon Desktop Tray**:
   - Implemented via `pystray` with the native GTK backend and Cinnamon popup coordinate patch.
   - Right-click menu with **Open in Browser**, **Copy URL**, **Open Samplepack Folder** (Nemo), and **Shutdown**.
@@ -59,16 +61,18 @@ To run in CLI mode without the desktop tray:
 |---|---|
 | <kbd>Space</kbd> | Play / Pause selected sample |
 | <kbd>↑</kbd> / <kbd>↓</kbd> (or <kbd>k</kbd> / <kbd>j</kbd>) | Navigate previous / next sample (with auto-play) |
+| <kbd>A</kbd> | Mark as reviewed & approved (👍) |
+| <kbd>D</kbd> | Needs action menu (👎: delete, flag, edit, or do nothing) |
+| <kbd>F</kbd> / <kbd>R</kbd> | Flag sample for revisit / open review dialog |
 | <kbd>L</kbd> | Toggle loop playback |
 | <kbd>C</kbd> | Copy relative sample path to clipboard |
-| <kbd>F</kbd> / <kbd>R</kbd> | Flag sample for revisit / open review dialog |
 | <kbd>S</kbd> | Toggle sample favorite (★) |
 | <kbd>/</kbd> | Focus search box |
 | <kbd>Esc</kbd> | Close active modal dialog or clear search focus |
 
 ## Architecture
 
-- `server.py` — Multi-threaded HTTP server handling static assets, atomic mutations (`/api/edit`, `/api/delete`, `/api/revisit`), and process termination (`/api/shutdown`).
+- `server.py` — Multi-threaded HTTP server handling static assets, atomic mutations (`/api/edit`, `/api/delete`, `/api/revisit`, `/api/review`), and process termination (`/api/shutdown`).
 - `tray.py` — Tray application providing Linux Mint status icon, desktop notifications (`notify-send`), and process lifecycle control.
 - `index.html` — Vanilla single-page application and player interface.
 - `launch.sh` — Entrypoint shell script handling virtual environment setup and launch flags.

@@ -391,6 +391,32 @@ def prune_manifest(rel_file: str, sample_count: int) -> None:
     atomic_write_text(MANIFEST_PATH, text)
 
 
+def prune_revisit(rel_file: str) -> None:
+    """Remove a sample from revisit_list.json and revisit_list.txt."""
+    if not REVISIT_JSON_PATH.exists():
+        return
+    try:
+        data = json.loads(REVISIT_JSON_PATH.read_text(encoding="utf-8"))
+        samples = [s for s in data.get("samples", []) if s.get("file") != rel_file]
+        if len(samples) != len(data.get("samples", [])):
+            now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            data["count"] = len(samples)
+            data["updated"] = now_str
+            data["samples"] = samples
+            atomic_write_json(REVISIT_JSON_PATH, data)
+            txt_lines = [
+                "# Samplepack Revisit List",
+                "# Format: <file> | <reason> | <date>",
+                f"# Total flagged: {len(samples)} (Updated {now_str})",
+                "",
+            ]
+            for s in samples:
+                txt_lines.append(f"{s['file']} | {s.get('reason', '')} | {s.get('date', '')}")
+            REVISIT_TXT_PATH.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def delete_sample(raw_file: object) -> dict:
     """Delete one pack WAV and prune every generated index. Idempotent."""
     rel_file = validate_rel_file(raw_file)
@@ -407,6 +433,7 @@ def delete_sample(raw_file: object) -> dict:
         prune_provenance(rel_file)
         prune_index(rel_file, catalog["samples"])
         prune_manifest(rel_file, catalog["count"])
+        prune_revisit(rel_file)
 
     return {"ok": True, "deleted": rel_file, "count": catalog["count"]}
 
@@ -812,6 +839,9 @@ def toggle_revisit(payload: dict) -> dict:
                 s["revisit"] = flagged
                 s["revisit_reason"] = reason if flagged else None
                 s["revisit_date"] = now_str if flagged else None
+                if flagged:
+                    s["reviewed"] = False
+                    s["reviewed_date"] = None
                 break
         atomic_write_json(CATALOG_PATH, catalog)
 
@@ -822,6 +852,68 @@ def toggle_revisit(payload: dict) -> dict:
             "reason": reason,
             "count": len(existing_samples),
             "samples": existing_samples,
+            "reviewed": False if flagged else None,
+        }
+
+
+def get_reviewed_list() -> dict:
+    catalog = read_catalog()
+    samples = catalog.get("samples", [])
+    reviewed = [
+        {
+            "file": s.get("file"),
+            "name": s.get("name"),
+            "reviewed_date": s.get("reviewed_date"),
+        }
+        for s in samples
+        if s.get("reviewed")
+    ]
+    return {
+        "ok": True,
+        "count": len(reviewed),
+        "total": len(samples),
+        "samples": reviewed,
+    }
+
+
+def set_reviewed(payload: dict) -> dict:
+    rel_path = validate_rel_file(payload.get("file"))
+    reviewed = bool(payload.get("reviewed", True))
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    with MUTATION_LOCK:
+        catalog = read_catalog()
+        samples = catalog.get("samples", [])
+        target = None
+        for s in samples:
+            if s.get("file") == rel_path:
+                target = s
+                s["reviewed"] = reviewed
+                s["reviewed_date"] = now_str if reviewed else None
+                if reviewed and s.get("revisit"):
+                    s["revisit"] = False
+                    s["revisit_reason"] = None
+                    s["revisit_date"] = None
+                break
+
+        if target is None:
+            raise EditError(f"sample not found in catalog.json: {rel_path}", status=404)
+
+        if reviewed:
+            prune_revisit(rel_path)
+
+        reviewed_count = sum(1 for s in samples if s.get("reviewed"))
+        revisit_count = sum(1 for s in samples if s.get("revisit"))
+        atomic_write_json(CATALOG_PATH, catalog)
+
+        return {
+            "ok": True,
+            "file": rel_path,
+            "reviewed": reviewed,
+            "reviewed_date": target.get("reviewed_date"),
+            "reviewed_count": reviewed_count,
+            "revisit_count": revisit_count,
+            "sample": target,
         }
 
 
@@ -836,6 +928,9 @@ class SamplepackHandler(SimpleHTTPRequestHandler):
         if route == "/api/revisit":
             self._send_json(get_revisit_list(), status=200)
             return
+        if route in ("/api/review", "/api/approve"):
+            self._send_json(get_reviewed_list(), status=200)
+            return
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
@@ -849,10 +944,25 @@ class SamplepackHandler(SimpleHTTPRequestHandler):
         if route in ("/api/revisit", "/api/flag"):
             self._handle_revisit()
             return
+        if route in ("/api/review", "/api/approve"):
+            self._handle_review()
+            return
         if route == "/api/shutdown":
             self._handle_shutdown()
             return
         self._send_json({"ok": False, "error": "not found"}, status=404)
+
+    def _handle_review(self) -> None:
+        try:
+            payload = self._read_json_body()
+            result = set_reviewed(payload)
+        except (DeleteError, EditError) as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=getattr(exc, "status", 400))
+            return
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"server error: {exc}"}, status=500)
+            return
+        self._send_json(result)
 
     def _handle_revisit(self) -> None:
         try:

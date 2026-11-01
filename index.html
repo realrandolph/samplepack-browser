@@ -379,6 +379,66 @@ main.grid-view {
   color: #ff9e58;
   font-weight: 700;
 }
+.thumbs-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.thumbs-btn {
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.74rem;
+  line-height: 1;
+  padding: 0.22rem 0.5rem;
+  transition: all 0.12s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  user-select: none;
+}
+.thumbs-down-btn:hover {
+  background: #2a1512;
+  border-color: #f0883e;
+  color: #ff9e58;
+}
+.thumbs-down-btn.active {
+  background: #3d1b14;
+  border-color: #ff7043;
+  color: #ff8a65;
+  font-weight: 700;
+}
+.thumbs-up-btn:hover {
+  background: #11281a;
+  border-color: #38ef7d;
+  color: #38ef7d;
+}
+.thumbs-up-btn.active {
+  background: #143522;
+  border-color: #38ef7d;
+  color: #4ef08d;
+  font-weight: 700;
+  box-shadow: 0 0 8px rgba(56, 239, 125, 0.2);
+}
+.reviewed-check {
+  display: inline-block;
+  color: #38ef7d;
+  font-weight: 800;
+  font-size: 0.9rem;
+  margin-left: 0.35rem;
+  vertical-align: middle;
+}
+.badge.reviewed-badge {
+  background: #0d2818;
+  border-color: #1f6f3f;
+  color: #38ef7d;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
 .badge.revisit-badge {
   background: #2a150c;
   border-color: #7d3f1a;
@@ -396,6 +456,82 @@ main.grid-view {
 }
 .revisit-chip:hover {
   border-color: #f0883e;
+}
+#thumbs-down-dialog { width: min(540px, 94vw); }
+#thumbs-down-dialog .modal-head h3 { color: #ff9e58; }
+.action-choices-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+}
+.action-choice-card {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  background: #141a19;
+  border: 1px solid var(--line-bright);
+  padding: 0.75rem 0.95rem;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  transition: all 0.12s ease;
+  width: 100%;
+}
+.action-choice-card:hover {
+  background: #1b2422;
+  border-color: var(--cyan);
+}
+.action-choice-card .choice-icon {
+  font-size: 1.35rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.action-choice-card .choice-content {
+  flex: 1;
+  min-width: 0;
+}
+.action-choice-card .choice-title {
+  font-weight: 700;
+  font-size: 0.88rem;
+  margin-bottom: 0.2rem;
+}
+.action-choice-card .choice-desc {
+  font-size: 0.74rem;
+  color: var(--ink-soft);
+  line-height: 1.35;
+}
+.action-choice-card .choice-kbd {
+  margin-left: auto;
+  align-self: center;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.action-choice-card.choice-delete:hover {
+  border-color: #ff5a5a;
+  background: #251414;
+}
+.action-choice-card.choice-delete:hover .choice-title {
+  color: #ff6868;
+}
+.action-choice-card.choice-flag:hover {
+  border-color: #f0883e;
+  background: #281810;
+}
+.action-choice-card.choice-flag:hover .choice-title {
+  color: #ff9e58;
+}
+.action-choice-card.choice-edit:hover {
+  border-color: var(--acid);
+  background: #202613;
+}
+.action-choice-card.choice-edit:hover .choice-title {
+  color: var(--acid);
+}
+.action-choice-card.choice-nothing:hover {
+  border-color: var(--muted);
+  background: #181d1c;
 }
 #revisit-dialog { width: min(540px, 94vw); }
 #revisit-dialog .modal-head h3 { color: #f0883e; }
@@ -746,6 +882,7 @@ pre.json-dump {
     <div class="stat-box"><span class="num" id="stat-cats">—</span><span class="lbl">Categories</span></div>
     <div class="stat-box"><span class="num" id="stat-roles">—</span><span class="lbl">Roles</span></div>
     <div class="stat-box"><span class="num" id="stat-favs">0</span><span class="lbl">Favorites</span></div>
+    <div class="stat-box" id="stat-reviewed-box" style="cursor:pointer" title="Click to filter by reviewed & approved samples"><span class="num" id="stat-reviewed" style="color:#38ef7d">0</span><span class="lbl">Reviewed</span></div>
     <div class="stat-box" id="stat-revisit-box" style="cursor:pointer" title="Click to filter by flagged samples"><span class="num" id="stat-revisit" style="color:#ff9e58">0</span><span class="lbl">Revisit</span></div>
     <button id="server-shutdown-btn" class="btn btn-sm" type="button" title="Shut down the local samplepack server process" style="border-color:#5c2424;color:#ff8080;padding:0.5rem 0.75rem">⏹ Shutdown Server</button>
   </div>
@@ -774,6 +911,7 @@ pre.json-dump {
       <option value="name-asc">Name: A → Z</option>
     </select>
     <button id="fav-filter-btn" class="btn" type="button" title="Show only favorited samples">★ Favorites</button>
+    <button id="reviewed-filter-btn" class="btn" type="button" title="Show only reviewed & approved samples">✓ Reviewed <span id="reviewed-badge" style="background:#143522;color:#38ef7d;padding:0.1rem 0.35rem;border-radius:2px;font-size:0.68rem;margin-left:0.25rem">0</span></button>
     <button id="revisit-filter-btn" class="btn" type="button" title="Show only samples flagged for revisit">🚩 Revisit <span id="revisit-badge" style="background:#3d2012;color:#ff9e58;padding:0.1rem 0.35rem;border-radius:2px;font-size:0.68rem;margin-left:0.25rem">0</span></button>
     <button id="view-toggle-btn" class="btn" type="button" title="Switch between Grid Cards and Compact Table">Table View</button>
   </div>
@@ -790,7 +928,9 @@ pre.json-dump {
   <div class="kbd-hints">
     <label style="cursor:pointer;margin-right:0.5rem"><input type="checkbox" id="autoplay-nav" checked> Auto-play on ↑/↓</label>
     <span><kbd>Space</kbd> Play/Pause</span>
-    <span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span>
+    <span><kbd>↑</kbd><kbd>↓</kbd> Nav</span>
+    <span><kbd>A</kbd> Approve (👍)</span>
+    <span><kbd>D</kbd> Action (👎)</span>
     <span><kbd>F</kbd> Flag</span>
     <span><kbd>L</kbd> Loop</span>
     <span><kbd>C</kbd> Copy Path</span>
@@ -819,11 +959,14 @@ pre.json-dump {
     </div>
   </div>
   <div class="player-right">
+    <div class="thumbs-group" role="group" aria-label="Sample review">
+      <button id="np-thumbs-down-btn" class="btn btn-sm thumbs-btn thumbs-down-btn" type="button" title="Sample needs action: delete, flag, or edit (D or 👎)">👎 Action</button>
+      <button id="np-thumbs-up-btn" class="btn btn-sm thumbs-btn thumbs-up-btn" type="button" title="Mark as reviewed & approved (A or 👍)">👍 Approve</button>
+    </div>
     <label title="Audition volume" style="display:flex;align-items:center;gap:0.35rem;font-size:0.72rem;color:var(--muted)">
       Vol <input id="vol-slider" class="vol-slider" type="range" min="0" max="1" step="0.02" value="0.9">
     </label>
     <button id="np-copy-btn" class="btn btn-sm" type="button" title="Copy samplepack/<file> path (C)">Copy Path</button>
-    <button id="np-flag-btn" class="btn btn-sm flag-btn" type="button" title="Flag current sample for revisit (F)">🚩 Revisit</button>
     <button id="np-info-btn" class="btn btn-sm" type="button" title="Inspect provenance & license">Provenance</button>
   </div>
 </footer>
@@ -931,6 +1074,56 @@ pre.json-dump {
   </div>
 </dialog>
 
+<dialog id="thumbs-down-dialog" aria-labelledby="td-title">
+  <div class="modal-head">
+    <div>
+      <h3 id="td-title">👎 Sample Needs Action</h3>
+      <div id="td-file" style="color:var(--muted);font-size:0.76rem;margin-top:0.2rem"></div>
+    </div>
+    <button id="td-close" class="btn btn-sm" type="button">Close (Esc)</button>
+  </div>
+  <p style="margin:0.2rem 0 0.8rem;color:var(--ink-soft);font-size:0.84rem;line-height:1.4">
+    What would you like to do with this sample?
+  </p>
+  <div class="action-choices-grid">
+    <button type="button" class="action-choice-card choice-delete" id="td-opt-delete">
+      <div class="choice-icon">🗑️</div>
+      <div class="choice-content">
+        <div class="choice-title">Delete sample</div>
+        <div class="choice-desc">Permanently remove this WAV and prune all index and catalog entries.</div>
+      </div>
+      <kbd class="choice-kbd">1</kbd>
+    </button>
+    <button type="button" class="action-choice-card choice-flag" id="td-opt-flag">
+      <div class="choice-icon">🚩</div>
+      <div class="choice-content">
+        <div class="choice-title">Flag for review</div>
+        <div class="choice-desc">Mark for revisit with notes (cut off early, noisy, level issues, miscategorized).</div>
+      </div>
+      <kbd class="choice-kbd">2</kbd>
+    </button>
+    <button type="button" class="action-choice-card choice-edit" id="td-opt-edit">
+      <div class="choice-icon">✎</div>
+      <div class="choice-content">
+        <div class="choice-title">Edit metadata</div>
+        <div class="choice-desc">Update name, category, role, tags, transcript, or description.</div>
+      </div>
+      <kbd class="choice-kbd">3</kbd>
+    </button>
+    <button type="button" class="action-choice-card choice-nothing" id="td-opt-nothing">
+      <div class="choice-icon">✕</div>
+      <div class="choice-content">
+        <div class="choice-title">Do nothing</div>
+        <div class="choice-desc">Keep sample as-is and dismiss without making any changes.</div>
+      </div>
+      <kbd class="choice-kbd">Esc</kbd>
+    </button>
+  </div>
+  <div class="dialog-actions" style="margin-top:1rem">
+    <button id="td-cancel" class="btn" type="button">Cancel</button>
+  </div>
+</dialog>
+
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -947,6 +1140,7 @@ pre.json-dump {
     search: "",
     sort: "default",
     favOnly: false,
+    reviewedOnly: false,
     revisitOnly: false,
     view: "grid",
     selectedIndex: -1,
@@ -961,6 +1155,10 @@ pre.json-dump {
     statCats: document.getElementById("stat-cats"),
     statRoles: document.getElementById("stat-roles"),
     statFavs: document.getElementById("stat-favs"),
+    statReviewed: document.getElementById("stat-reviewed"),
+    statReviewedBox: document.getElementById("stat-reviewed-box"),
+    reviewedFilterBtn: document.getElementById("reviewed-filter-btn"),
+    reviewedBadge: document.getElementById("reviewed-badge"),
     search: document.getElementById("search"),
     searchClear: document.getElementById("search-clear"),
     roleSelect: document.getElementById("role-select"),
@@ -987,6 +1185,17 @@ pre.json-dump {
     volSlider: document.getElementById("vol-slider"),
     npCopyBtn: document.getElementById("np-copy-btn"),
     npInfoBtn: document.getElementById("np-info-btn"),
+    npThumbsDownBtn: document.getElementById("np-thumbs-down-btn"),
+    npThumbsUpBtn: document.getElementById("np-thumbs-up-btn"),
+    thumbsDownDialog: document.getElementById("thumbs-down-dialog"),
+    tdTitle: document.getElementById("td-title"),
+    tdFile: document.getElementById("td-file"),
+    tdClose: document.getElementById("td-close"),
+    tdOptDelete: document.getElementById("td-opt-delete"),
+    tdOptFlag: document.getElementById("td-opt-flag"),
+    tdOptEdit: document.getElementById("td-opt-edit"),
+    tdOptNothing: document.getElementById("td-opt-nothing"),
+    tdCancel: document.getElementById("td-cancel"),
     provDialog: document.getElementById("prov-dialog"),
     modalTitle: document.getElementById("modal-title"),
     modalFile: document.getElementById("modal-file"),
@@ -1043,6 +1252,8 @@ pre.json-dump {
   let savingEdit = false;
   let revisitTarget = null;
   let savingRevisit = false;
+  let actionTarget = null;
+  let savingReview = false;
 
   function esc(value) {
     return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -1173,6 +1384,7 @@ pre.json-dump {
       if (state.dry && s.dry_processed !== state.dry) return false;
       if (state.tag && !(s.tags || []).includes(state.tag)) return false;
       if (state.favOnly && !state.favorites.has(s.file)) return false;
+      if (state.reviewedOnly && !s.reviewed) return false;
       if (state.revisitOnly && !s.revisit) return false;
       if (qTokens.length > 0) {
         for (const tok of qTokens) {
@@ -1217,7 +1429,7 @@ pre.json-dump {
       els.activeTagContainer.appendChild(chip);
     }
     const anyFilter = Boolean(
-      state.category || state.role || state.use || state.dry || state.tag || state.search || state.favOnly || state.revisitOnly
+      state.category || state.role || state.use || state.dry || state.tag || state.search || state.favOnly || state.reviewedOnly || state.revisitOnly
     );
     els.resetBtn.hidden = !anyFilter;
   }
@@ -1244,7 +1456,8 @@ pre.json-dump {
       const card = document.createElement("article");
       card.className = "card" +
         (idx === state.selectedIndex ? " selected" : "") +
-        (s.file === state.playingFile && !audio.paused ? " playing" : "");
+        (s.file === state.playingFile && !audio.paused ? " playing" : "") +
+        (s.reviewed ? " reviewed" : "");
       card.dataset.index = idx;
       card.dataset.file = s.file;
 
@@ -1260,18 +1473,20 @@ pre.json-dump {
             <span class="badge">${esc(s.role || "sample")}</span>
             ${s.suggested_use ? `<span class="badge use-sug">${esc(s.suggested_use)}</span>` : ""}
             <span class="badge dry">${esc(s.dry_processed || "dry")}</span>
+            ${s.reviewed ? `<span class="badge reviewed-badge" title="Reviewed &amp; approved on ${esc(s.reviewed_date || '')}">✓ Approved</span>` : ""}
             ${s.revisit ? `<span class="badge revisit-badge" title="Flagged: ${esc(s.revisit_reason || 'Needs review')}">🚩 Revisit</span>` : ""}
           </div>
           <div class="card-meta-right">
             <span>${s.duration.toFixed(2)}s</span>
-            <button class="flag-btn ${s.revisit ? "active" : ""}" type="button" title="${s.revisit ? `Flagged: ${esc(s.revisit_reason || 'Needs review')} (click to edit/unflag)` : "Flag for revisit (F or R)"}">🚩</button>
+            <button class="thumbs-btn thumbs-down-btn ${s.revisit ? "active" : ""}" type="button" data-action="thumbs-down" title="${s.revisit ? `Flagged: ${esc(s.revisit_reason || 'Needs review')} (Click to action)` : 'Needs action: delete, flag, or edit (👎)'}">👎</button>
+            <button class="thumbs-btn thumbs-up-btn ${s.reviewed ? "active" : ""}" type="button" data-action="thumbs-up" title="${s.reviewed ? 'Reviewed &amp; Approved (click to toggle)' : 'Mark as reviewed &amp; approved (👍)'}">${s.reviewed ? "✓" : "👍"}</button>
             <button class="fav-btn ${isFav ? "active" : ""}" type="button" title="Toggle favorite">${isFav ? "★" : "☆"}</button>
             <button class="del-btn" type="button" title="Delete sample permanently" aria-label="Delete ${esc(s.name)}">✕</button>
           </div>
         </div>
         <div class="card-title-row">
           <div>
-            <h2>${esc(s.name)}</h2>
+            <h2>${esc(s.name)}${s.reviewed ? ` <span class="reviewed-check" title="Reviewed &amp; approved">✓</span>` : ""}</h2>
             <div class="file-path">samplepack/${esc(s.file)}</div>
           </div>
         </div>
@@ -1328,10 +1543,22 @@ pre.json-dump {
           toggleFav(s.file);
           return;
         }
+        const tdEl = e.target.closest('[data-action="thumbs-down"]');
+        if (tdEl) {
+          e.stopPropagation();
+          openThumbsDownDialog(s);
+          return;
+        }
+        const tuEl = e.target.closest('[data-action="thumbs-up"]');
+        if (tuEl) {
+          e.stopPropagation();
+          toggleReviewed(s);
+          return;
+        }
         const flagEl = e.target.closest(".flag-btn");
         if (flagEl) {
           e.stopPropagation();
-          openRevisitDialog(s);
+          openThumbsDownDialog(s);
           return;
         }
         const delEl = e.target.closest(".del-btn");
@@ -1371,7 +1598,8 @@ pre.json-dump {
         <tr>
           <th>Play</th>
           <th>★</th>
-          <th>🚩</th>
+          <th>👍</th>
+          <th>👎</th>
           <th>Category</th>
           <th>Role</th>
           <th>File / Name</th>
@@ -1391,14 +1619,16 @@ pre.json-dump {
       const isPlaying = s.file === state.playingFile && !audio.paused;
       tr.className =
         (idx === state.selectedIndex ? "selected " : "") +
-        (isPlaying ? "playing" : "");
+        (isPlaying ? "playing" : "") +
+        (s.reviewed ? " reviewed" : "");
       tr.innerHTML = `
         <td><button class="btn btn-sm play-btn" type="button" data-action="play">${isPlaying ? "⏸" : "▶"}</button></td>
         <td><button class="fav-btn ${isFav ? "active" : ""}" type="button">${isFav ? "★" : "☆"}</button></td>
-        <td><button class="flag-btn ${s.revisit ? "active" : ""}" type="button" data-action="flag" title="${s.revisit ? `Flagged: ${esc(s.revisit_reason || 'Needs review')}` : 'Flag for revisit'}">🚩</button></td>
+        <td><button class="thumbs-btn thumbs-up-btn ${s.reviewed ? "active" : ""}" type="button" data-action="thumbs-up" title="${s.reviewed ? 'Reviewed &amp; Approved (click to toggle)' : 'Mark as reviewed &amp; approved (👍)'}">${s.reviewed ? "✓" : "👍"}</button></td>
+        <td><button class="thumbs-btn thumbs-down-btn ${s.revisit ? "active" : ""}" type="button" data-action="thumbs-down" title="${s.revisit ? `Flagged: ${esc(s.revisit_reason || 'Needs review')}` : 'Needs action: delete, flag, or edit (👎)'}">👎</button></td>
         <td><span class="badge cat" data-cat="${esc(s.category)}">${esc(s.category)}</span></td>
         <td><span class="badge">${esc(s.role)}</span></td>
-        <td><strong>${esc(s.name)}</strong><div class="file-path">samplepack/${esc(s.file)}</div></td>
+        <td><strong>${esc(s.name)}</strong>${s.reviewed ? ` <span class="reviewed-check" title="Reviewed &amp; approved">✓</span>` : ""}<div class="file-path">samplepack/${esc(s.file)}</div></td>
         <td>${s.transcript ? `“${esc(s.transcript)}”` : (s.description ? esc(s.description) : "—")}</td>
         <td>${s.duration.toFixed(2)}s</td>
         <td>${toDb(s.peak)}</td>
@@ -1420,7 +1650,8 @@ pre.json-dump {
         if (act) {
           e.stopPropagation();
           if (act.dataset.action === "play") togglePlaySample(idx);
-          else if (act.dataset.action === "flag") openRevisitDialog(s);
+          else if (act.dataset.action === "thumbs-up") toggleReviewed(s);
+          else if (act.dataset.action === "thumbs-down" || act.dataset.action === "flag") openThumbsDownDialog(s);
           else if (act.dataset.action === "copy-path") copyText(`samplepack/${s.file}`, "sample path");
           else if (act.dataset.action === "edit") openEditSample(s);
           else if (act.dataset.action === "prov") openProvenanceModal(s);
@@ -1488,6 +1719,20 @@ pre.json-dump {
       : (s.description || `samplepack/${s.file}`);
     els.npTelemetry.textContent =
       `Peak ${toDb(s.peak)} · RMS ${toDb(s.rms)} · Centroid ${s.centroid_hz ? Math.round(s.centroid_hz) + " Hz" : "—"} · ${s.license || "Original synthesis"}`;
+    if (els.npThumbsUpBtn) {
+      els.npThumbsUpBtn.classList.toggle("active", !!s.reviewed);
+      els.npThumbsUpBtn.textContent = s.reviewed ? "👍 Approved ✓" : "👍 Approve";
+      els.npThumbsUpBtn.title = s.reviewed
+        ? `Reviewed & approved on ${s.reviewed_date || "now"} (Click to toggle approval, or press A)`
+        : "Mark current sample as reviewed & approved (A or 👍)";
+    }
+    if (els.npThumbsDownBtn) {
+      els.npThumbsDownBtn.classList.toggle("active", !!s.revisit);
+      els.npThumbsDownBtn.textContent = s.revisit ? "👎 Flagged" : "👎 Action";
+      els.npThumbsDownBtn.title = s.revisit
+        ? `Flagged: ${s.revisit_reason || "Needs review"} (Click to choose action: delete, flag, edit)`
+        : "Sample needs action: delete, flag for review, or edit (D or 👎)";
+    }
     if (els.npFlagBtn) {
       els.npFlagBtn.classList.toggle("active", !!s.revisit);
       els.npFlagBtn.textContent = s.revisit ? "🚩 Flagged" : "🚩 Revisit";
@@ -1704,6 +1949,7 @@ pre.json-dump {
     els.statCats.textContent = new Set(state.samples.map((s) => s.category)).size;
     els.statRoles.textContent = new Set(state.samples.map((s) => s.role).filter(Boolean)).size;
     els.statFavs.textContent = state.favorites.size;
+    updateCounts();
 
     if (state.selectedIndex >= state.filtered.length) {
       state.selectedIndex = state.filtered.length - 1;
@@ -1867,6 +2113,7 @@ pre.json-dump {
     els.statTotal.textContent = state.samples.length;
     els.statCats.textContent = new Set(state.samples.map((s) => s.category)).size;
     els.statRoles.textContent = new Set(state.samples.map((s) => s.role).filter(Boolean)).size;
+    updateCounts();
 
     refreshFilterOptions();
     applyFilters();
@@ -1943,12 +2190,79 @@ pre.json-dump {
     if (!savingEdit) editTarget = null;
   });
 
-  // Revisit Functions
-  function updateRevisitCounts() {
+  // Review & Revisit Functions
+  function updateCounts() {
+    const reviewed = state.samples.filter((s) => !!s.reviewed);
     const flagged = state.samples.filter((s) => !!s.revisit);
+    if (els.statReviewed) els.statReviewed.textContent = reviewed.length;
+    if (els.reviewedBadge) els.reviewedBadge.textContent = reviewed.length;
     if (els.statRevisit) els.statRevisit.textContent = flagged.length;
     if (els.revisitBadge) els.revisitBadge.textContent = flagged.length;
     if (els.copyRevisitBtn) els.copyRevisitBtn.hidden = (flagged.length === 0);
+  }
+  const updateRevisitCounts = updateCounts;
+
+  function openThumbsDownDialog(s) {
+    if (!s) return;
+    actionTarget = s;
+    if (els.tdFile) els.tdFile.textContent = `samplepack/${s.file}`;
+    if (els.thumbsDownDialog) {
+      els.thumbsDownDialog.showModal();
+    }
+  }
+
+  function closeThumbsDownDialog() {
+    if (els.thumbsDownDialog && els.thumbsDownDialog.open) {
+      els.thumbsDownDialog.close();
+    }
+    actionTarget = null;
+  }
+
+  async function toggleReviewed(s) {
+    if (!s || savingReview) return;
+    await setReviewed(s, !s.reviewed);
+  }
+
+  async function setReviewed(s, reviewed) {
+    if (!s || savingReview) return;
+    savingReview = true;
+    try {
+      const res = await fetch("./api/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file: s.file,
+          reviewed: reviewed,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data || !data.ok) {
+        throw new Error((data && data.error) || `HTTP ${res.status}`);
+      }
+
+      s.reviewed = reviewed;
+      s.reviewed_date = reviewed ? (data.reviewed_date || new Date().toISOString().slice(0, 19)) : null;
+
+      if (reviewed && s.revisit) {
+        s.revisit = false;
+        s.revisit_reason = null;
+        s.revisit_date = null;
+      }
+
+      updateCounts();
+      applyFilters();
+      highlightActiveCards();
+
+      const current = state.filtered[state.selectedIndex];
+      if (current && current.file === s.file) updateTransportInfo(s);
+
+      showToast(reviewed ? `✓ Marked ${s.name} as reviewed & approved` : `Unmarked ${s.name} as reviewed`);
+    } catch (err) {
+      showToast(`Review error: ${err.message || err}`);
+      console.error(err);
+    } finally {
+      savingReview = false;
+    }
   }
 
   function openRevisitDialog(s) {
@@ -1991,7 +2305,11 @@ pre.json-dump {
       }
       s.revisit = flagged;
       s.revisit_reason = flagged ? (reason || "Flagged for revisit") : null;
-      updateRevisitCounts();
+      if (flagged) {
+        s.reviewed = false;
+        s.reviewed_date = null;
+      }
+      updateCounts();
       applyFilters();
       highlightActiveCards();
       const current = state.filtered[state.selectedIndex];
@@ -2055,6 +2373,93 @@ pre.json-dump {
   if (els.revisitClose) els.revisitClose.addEventListener("click", closeRevisitDialog);
   if (els.copyRevisitBtn) els.copyRevisitBtn.addEventListener("click", copyRevisitList);
 
+  // Thumbs Down Dialog Actions
+  if (els.tdOptDelete) {
+    els.tdOptDelete.addEventListener("click", () => {
+      const target = actionTarget;
+      closeThumbsDownDialog();
+      if (target) askDeleteSample(target);
+    });
+  }
+
+  if (els.tdOptFlag) {
+    els.tdOptFlag.addEventListener("click", () => {
+      const target = actionTarget;
+      closeThumbsDownDialog();
+      if (target) openRevisitDialog(target);
+    });
+  }
+
+  if (els.tdOptEdit) {
+    els.tdOptEdit.addEventListener("click", () => {
+      const target = actionTarget;
+      closeThumbsDownDialog();
+      if (target) openEditSample(target);
+    });
+  }
+
+  if (els.tdOptNothing) {
+    els.tdOptNothing.addEventListener("click", () => {
+      closeThumbsDownDialog();
+    });
+  }
+
+  if (els.tdClose) els.tdClose.addEventListener("click", closeThumbsDownDialog);
+  if (els.tdCancel) els.tdCancel.addEventListener("click", closeThumbsDownDialog);
+
+  if (els.thumbsDownDialog) {
+    els.thumbsDownDialog.addEventListener("click", (e) => {
+      if (e.target === els.thumbsDownDialog) closeThumbsDownDialog();
+    });
+    els.thumbsDownDialog.addEventListener("keydown", (e) => {
+      if (e.key === "1") {
+        e.preventDefault();
+        els.tdOptDelete?.click();
+      } else if (e.key === "2") {
+        e.preventDefault();
+        els.tdOptFlag?.click();
+      } else if (e.key === "3") {
+        e.preventDefault();
+        els.tdOptEdit?.click();
+      } else if (e.key === "4" || e.key === "Escape") {
+        e.preventDefault();
+        closeThumbsDownDialog();
+      }
+    });
+  }
+
+  // Bottom Player Bar Thumbs Buttons
+  if (els.npThumbsUpBtn) {
+    els.npThumbsUpBtn.addEventListener("click", () => {
+      const s = state.filtered[state.selectedIndex];
+      if (s) toggleReviewed(s);
+    });
+  }
+
+  if (els.npThumbsDownBtn) {
+    els.npThumbsDownBtn.addEventListener("click", () => {
+      const s = state.filtered[state.selectedIndex];
+      if (s) openThumbsDownDialog(s);
+    });
+  }
+
+  // Filter & Stat Box Listeners
+  if (els.reviewedFilterBtn) {
+    els.reviewedFilterBtn.addEventListener("click", () => {
+      state.reviewedOnly = !state.reviewedOnly;
+      els.reviewedFilterBtn.classList.toggle("active", state.reviewedOnly);
+      applyFilters();
+    });
+  }
+
+  if (els.statReviewedBox) {
+    els.statReviewedBox.addEventListener("click", () => {
+      state.reviewedOnly = !state.reviewedOnly;
+      if (els.reviewedFilterBtn) els.reviewedFilterBtn.classList.toggle("active", state.reviewedOnly);
+      applyFilters();
+    });
+  }
+
   if (els.revisitFilterBtn) {
     els.revisitFilterBtn.addEventListener("click", () => {
       state.revisitOnly = !state.revisitOnly;
@@ -2074,7 +2479,7 @@ pre.json-dump {
   if (els.npFlagBtn) {
     els.npFlagBtn.addEventListener("click", () => {
       const s = state.filtered[state.selectedIndex];
-      if (s) openRevisitDialog(s);
+      if (s) openThumbsDownDialog(s);
     });
   }
 
@@ -2146,12 +2551,14 @@ pre.json-dump {
     state.tag = "";
     state.search = "";
     state.favOnly = false;
+    state.reviewedOnly = false;
     state.revisitOnly = false;
     els.search.value = "";
     els.roleSelect.value = "";
     els.useSelect.value = "";
     els.drySelect.value = "";
     els.favFilterBtn.classList.remove("active");
+    if (els.reviewedFilterBtn) els.reviewedFilterBtn.classList.remove("active");
     if (els.revisitFilterBtn) els.revisitFilterBtn.classList.remove("active");
     syncHash();
     applyFilters();
@@ -2212,7 +2619,7 @@ pre.json-dump {
       els.search.blur();
       return;
     }
-    if (inInput || els.provDialog.open || els.deleteDialog.open || els.editDialog.open) return;
+    if (inInput || els.provDialog.open || els.deleteDialog.open || els.editDialog.open || (els.revisitDialog && els.revisitDialog.open) || (els.thumbsDownDialog && els.thumbsDownDialog.open)) return;
 
     if (e.code === "Space") {
       e.preventDefault();
@@ -2223,6 +2630,14 @@ pre.json-dump {
     } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault();
       els.prevBtn.click();
+    } else if (e.key === "a" || e.key === "A") {
+      e.preventDefault();
+      const s = state.filtered[state.selectedIndex];
+      if (s) toggleReviewed(s);
+    } else if (e.key === "d" || e.key === "D") {
+      e.preventDefault();
+      const s = state.filtered[state.selectedIndex];
+      if (s) openThumbsDownDialog(s);
     } else if (e.key === "l" || e.key === "L") {
       e.preventDefault();
       els.loopBtn.click();
@@ -2255,7 +2670,7 @@ pre.json-dump {
       els.statCats.textContent = (cat.categories || []).length;
       els.statRoles.textContent = Object.keys(cat.roles || {}).length;
       els.statFavs.textContent = state.favorites.size;
-      updateRevisitCounts();
+      updateCounts();
 
       const roles = Object.keys(cat.roles || {}).sort();
       for (const r of roles) {
