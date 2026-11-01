@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Samplepack Browser
+Comment=Browse, audition, edit, and manage audio samples
+Exec=/home/dolf/Documents/music/samplepack/launch.sh
+Path=/home/dolf/Documents/music/samplepack
+Icon=audio-speakers
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true

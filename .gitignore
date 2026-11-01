@@ -1,0 +1,51 @@
+# Exclude all audio and video media files
+*.wav
+*.WAV
+*.mp3
+*.MP3
+*.mp4
+*.MP4
+*.mpeg
+*.MPEG
+*.mpg
+*.MPG
+*.ogg
+*.OGG
+*.ogv
+*.OGV
+*.opus
+*.OPUS
+*.flac
+*.FLAC
+*.m4a
+*.M4A
+*.aac
+*.AAC
+*.aif
+*.aiff
+*.webm
+*.mkv
+*.avi
+*.mov
+
+# Exclude instance-specific collection data, catalogs, and manifests
+catalog.json
+INDEX.md
+manifest.txt
+revisit_list.json
+revisit_list.txt
+*sample_sheet.md
+samples_lacking_source_info.txt
+all_samples_without_source_links.txt
+speech_cutoff_audit.json
+speech_cutoff_audit.txt
+transcriptions_update.json
+
+# Exclude local staging, source archives, virtual environments, and caches
+source/
+work/
+sapolsky samples/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
