@@ -102,16 +102,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/samplepack-browser-linux-mint.zip
-            dist/samplepack-browser_1.0.0_all.deb
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-
       - name: Attach zip to manual run summary
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: |
@@ -126,3 +116,108 @@ jobs:
             unzip -Z dist/samplepack-browser-linux-mint.zip
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  package-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow pystray pyinstaller six
+
+      - name: Generate application icon
+        run: python packaging/windows/make_icon.py
+
+      - name: Freeze application with PyInstaller
+        run: >
+          pyinstaller --noconsole --onedir --name samplepack-browser
+          --icon packaging/windows/icon.ico
+          --add-data "index.html;."
+          --add-data "icon.png;."
+          --distpath build/windows/dist
+          --workpath build/windows/build
+          tray.py
+
+      - name: Verify frozen application
+        run: |
+          $exe = "build/windows/dist/samplepack-browser/samplepack-browser.exe"
+          if (-not (Test-Path $exe)) {
+            throw "PyInstaller did not produce $exe"
+          }
+          Get-ChildItem build/windows/dist/samplepack-browser | Select-Object Name, Length
+
+      - name: Copy installer icon next to the executable
+        run: |
+          Copy-Item packaging/windows/icon.ico build/windows/dist/samplepack-browser/icon.ico -Force
+          if (-not (Test-Path build/windows/dist/samplepack-browser/icon.ico)) {
+            throw "icon.ico was not copied into the application folder"
+          }
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile Inno Setup installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging/windows/installer.iss'
+
+      - name: Verify installer output
+        run: |
+          $setup = "dist/samplepack-browser-windows-setup.exe"
+          if (-not (Test-Path $setup)) {
+            throw "installer not found: $setup"
+          }
+          $size = (Get-Item $setup).Length
+          "installer size: {0:N0} bytes" -f $size
+          if ($size -le 1MB) {
+            throw "installer is too small ($size bytes); expected more than 1 MB"
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: samplepack-browser-windows
+          path: dist/samplepack-browser-windows-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [package, package-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -l release-assets
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/samplepack-browser-linux-mint.zip
+            release-assets/samplepack-browser_1.0.0_all.deb
+            release-assets/samplepack-browser-windows-setup.exe
+            release-assets/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
