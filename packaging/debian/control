@@ -1,0 +1,8 @@
+Package: samplepack-browser
+Version: 1.0.0
+Section: sound
+Priority: optional
+Architecture: all
+Maintainer: Samplepack Browser Team
+Depends: python3 (>= 3.10), python3-pil, python3-gi, gir1.2-gtk-3.0, libnotify-bin, xdg-utils
+Description: Standalone audio sample browser with Cinnamon system tray integration

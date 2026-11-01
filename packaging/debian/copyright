@@ -1,0 +1,19 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: samplepack-browser
+Source: https://github.com/samplepack-browser/samplepack-browser
+
+Files: *
+Copyright: 2026 Samplepack Browser Team
+License: MIT
+
+Files: usr/lib/samplepack-browser/vendor/pystray/*
+Copyright: 2016 Moses Palmer
+License: LGPL-3+
+Comment: pystray 0.19.5 is vendored unmodified so the tray application runs
+ without a network connection or pip. The full licence texts ship alongside
+ the module as vendor/pystray/COPYING and vendor/pystray/COPYING.LGPL.
+
+Files: usr/lib/samplepack-browser/vendor/six.py
+Copyright: 2010-2024 Benjamin Peterson
+License: MIT
+Comment: six 1.17.0 is vendored unmodified because pystray imports six.moves.

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Post-installation script for samplepack-browser.
+set -e
+
+# Refresh the desktop entry cache so the launcher shows up immediately.
+update-desktop-database -q || true
+
+# Refresh the hicolor icon cache so the tray/launcher icon resolves.
+gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+
+# Optionally drop a trusted launcher on the invoking user's desktop.
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+	USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+	if [ -n "$USER_HOME" ] && [ -d "$USER_HOME/Desktop" ] \
+		&& [ -f /usr/share/applications/samplepack-browser.desktop ]; then
+		cp -f /usr/share/applications/samplepack-browser.desktop \
+			"$USER_HOME/Desktop/samplepack-browser.desktop"
+		chown "$SUDO_USER:" "$USER_HOME/Desktop/samplepack-browser.desktop" || true
+		chmod 0755 "$USER_HOME/Desktop/samplepack-browser.desktop" || true
+		if command -v gio >/dev/null 2>&1; then
+			su - "$SUDO_USER" -c 'gio set "$HOME/Desktop/samplepack-browser.desktop" metadata::trusted true' || true
+		fi
+	fi
+fi
+
+exit 0

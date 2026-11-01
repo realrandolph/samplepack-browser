@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Samplepack Browser
+Comment=Browse, audition, edit, and manage audio samples
+Exec=samplepack-browser
+Icon=samplepack-browser
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true
