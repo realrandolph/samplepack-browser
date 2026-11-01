@@ -101,17 +101,21 @@ class CatalogDatabaseTests(unittest.TestCase):
         self.assertFalse(reviewed["revisit"])
 
     def test_mcp_search_and_selection_returns_verified_path(self) -> None:
-        available = next(catalog_db.SAMPLES_DIR.rglob("*.wav"))
-        relative = available.relative_to(catalog_db.SAMPLES_DIR).as_posix()
-        catalog_db.save_catalog({"samples": [sample_fixture(relative)]}, self.db, write_indexes=False)
-        with patch.dict(os.environ, {"SAMPLEPACK_DB": str(self.db)}):
-            result = mcp_protocol.call_tool("search_samples", {"query": "fixture", "limit": 5})
-            search_result = result["structuredContent"]
-            self.assertEqual(search_result["count"], 1)
-            selected = mcp_protocol.call_tool("select_sample", {"file": relative})
-            selected_result = selected["structuredContent"]
-            self.assertEqual(Path(selected_result["absolute_path"]), available.resolve())
-            self.assertTrue(Path(selected_result["absolute_path"]).is_file())
+        samples_root = Path(self.tempdir.name) / "samples"
+        fixture_file = samples_root / "kicks" / "kick_fixture.wav"
+        fixture_file.parent.mkdir(parents=True, exist_ok=True)
+        fixture_file.write_bytes(make_pcm24_stereo_wav())
+        relative = "kicks/kick_fixture.wav"
+        with patch.object(catalog_db, "SAMPLES_DIR", samples_root):
+            catalog_db.save_catalog({"samples": [sample_fixture(relative)]}, self.db, write_indexes=False)
+            with patch.dict(os.environ, {"SAMPLEPACK_DB": str(self.db)}):
+                result = mcp_protocol.call_tool("search_samples", {"query": "fixture", "limit": 5})
+                search_result = result["structuredContent"]
+                self.assertEqual(search_result["count"], 1)
+                selected = mcp_protocol.call_tool("select_sample", {"file": relative})
+                selected_result = selected["structuredContent"]
+                self.assertEqual(Path(selected_result["absolute_path"]), fixture_file.resolve())
+                self.assertTrue(Path(selected_result["absolute_path"]).is_file())
 
     def test_uploaded_wav_format_and_measurements(self) -> None:
         report = analyze_uploaded_wav(make_pcm24_stereo_wav())

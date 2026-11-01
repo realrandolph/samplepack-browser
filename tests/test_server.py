@@ -97,12 +97,25 @@ class ServerHTTPTests(unittest.TestCase):
             self.assertGreater(len(raw), 0, path)
             self.assertTrue(headers["Content-Type"], path)
 
-        sample = min(catalog_db.SAMPLES_DIR.rglob("*.wav"), key=lambda path: path.stat().st_size)
-        relative = sample.relative_to(catalog_db.SAMPLES_DIR).as_posix()
-        status, headers, raw = self.request("GET", "/samples/" + quote(relative))
-        self.assertEqual(status, 200)
-        self.assertEqual(raw, sample.read_bytes())
-        self.assertIn("audio", headers["Content-Type"])
+        sample_candidates = list(catalog_db.SAMPLES_DIR.rglob("*.wav")) if catalog_db.SAMPLES_DIR.exists() else []
+        created_temp = False
+        if sample_candidates:
+            sample = min(sample_candidates, key=lambda path: path.stat().st_size)
+        else:
+            sample = catalog_db.SAMPLES_DIR / "kicks" / "test_fixture.wav"
+            sample.parent.mkdir(parents=True, exist_ok=True)
+            from test_catalog_db import make_pcm24_stereo_wav
+            sample.write_bytes(make_pcm24_stereo_wav())
+            created_temp = True
+        try:
+            relative = sample.relative_to(catalog_db.SAMPLES_DIR).as_posix()
+            status, headers, raw = self.request("GET", "/samples/" + quote(relative))
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, sample.read_bytes())
+            self.assertIn("audio", headers["Content-Type"])
+        finally:
+            if created_temp:
+                sample.unlink(missing_ok=True)
 
     def test_static_allowlist_rejects_non_static_paths_and_traversal(self) -> None:
         blocked = (
