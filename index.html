@@ -571,6 +571,8 @@ main.grid-view {
 /* Edit dialog */
 #edit-dialog { width: min(620px, 94vw); }
 #edit-dialog .modal-head h3 { color: var(--acid); }
+#add-dialog { width: min(680px, 94vw); }
+#add-dialog .modal-head h3 { color: var(--acid); }
 .edit-form-grid {
   display: grid;
   grid-template-columns: 132px 1fr;
@@ -884,6 +886,7 @@ pre.json-dump {
     <div class="stat-box"><span class="num" id="stat-favs">0</span><span class="lbl">Favorites</span></div>
     <div class="stat-box" id="stat-reviewed-box" style="cursor:pointer" title="Click to filter by reviewed & approved samples"><span class="num" id="stat-reviewed" style="color:#38ef7d">0</span><span class="lbl">Reviewed</span></div>
     <div class="stat-box" id="stat-revisit-box" style="cursor:pointer" title="Click to filter by flagged samples"><span class="num" id="stat-revisit" style="color:#ff9e58">0</span><span class="lbl">Revisit</span></div>
+    <button id="add-sample-btn" class="btn btn-sm play-btn" type="button" title="Add a WAV file to the local sample library" style="padding:0.5rem 0.75rem">＋ Add Sample</button>
     <button id="server-shutdown-btn" class="btn btn-sm" type="button" title="Shut down the local samplepack server process" style="border-color:#5c2424;color:#ff8080;padding:0.5rem 0.75rem">⏹ Shutdown Server</button>
   </div>
 </header>
@@ -981,7 +984,7 @@ pre.json-dump {
   </div>
   <dl id="modal-kv" class="kv-grid"></dl>
   <details style="margin-top:1rem">
-    <summary style="cursor:pointer;color:var(--acid);font-size:0.76rem">Raw catalog.json entry</summary>
+    <summary style="cursor:pointer;color:var(--acid);font-size:0.76rem">Raw sample metadata</summary>
     <pre id="modal-json" class="json-dump"></pre>
   </details>
 </dialog>
@@ -994,9 +997,8 @@ pre.json-dump {
     </div>
   </div>
   <p class="del-warning">
-    This permanently deletes the WAV from disk and removes it from
-    <code>catalog.json</code>, <code>INDEX.md</code>, <code>manifest.txt</code>,
-    and <code>provenance.json</code>. This cannot be undone.
+    This permanently deletes the WAV from disk and removes its SQLite catalog
+    record and generated index entries. This cannot be undone.
   </p>
   <p id="del-error" class="del-error" role="alert" hidden></p>
   <div class="dialog-actions">
@@ -1037,11 +1039,59 @@ pre.json-dump {
       <label for="edit-description">Description</label>
       <textarea id="edit-description" class="form-field" rows="3"></textarea>
     </div>
-    <p class="edit-hint">Changing the category moves the file on disk to the new category directory.</p>
+    <p class="edit-hint">Changing the category moves the file under the matching folder in <code>samples/</code>.</p>
     <p id="edit-error" class="del-error" role="alert" hidden></p>
     <div class="dialog-actions">
       <button id="edit-cancel" class="btn" type="button">Cancel</button>
       <button id="edit-save" class="btn play-btn" type="submit">Save Changes</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="add-dialog" aria-labelledby="add-title">
+  <div class="modal-head">
+    <div>
+      <h3 id="add-title">＋ Add Sample to Local Library</h3>
+      <div style="color:var(--muted);font-size:0.76rem;margin-top:0.2rem">Imports a stereo 48 kHz, 24-bit PCM WAV into <code>samples/</code>.</div>
+    </div>
+    <button id="add-close" class="btn btn-sm" type="button">Close (Esc)</button>
+  </div>
+  <form id="add-form" enctype="multipart/form-data">
+    <datalist id="add-cat-datalist"></datalist>
+    <datalist id="add-role-datalist"></datalist>
+    <div class="edit-form-grid" style="margin-top:0.8rem">
+      <label for="add-audio">WAV file</label>
+      <input id="add-audio" class="form-field" type="file" accept=".wav,audio/wav" required>
+
+      <label for="add-name">Display name</label>
+      <input id="add-name" class="form-field" type="text" required autocomplete="off">
+
+      <label for="add-category">Category</label>
+      <input id="add-category" class="form-field" type="text" list="add-cat-datalist" required autocomplete="off" placeholder="e.g. speech">
+
+      <label for="add-role">Role</label>
+      <input id="add-role" class="form-field" type="text" list="add-role-datalist" required autocomplete="off" placeholder="e.g. speech, kick, texture">
+
+      <label for="add-use">Suggested use</label>
+      <input id="add-use" class="form-field" type="text" placeholder="e.g. INTRO / PRE-DROP" autocomplete="off">
+
+      <label for="add-tags">Tags</label>
+      <input id="add-tags" class="form-field" type="text" placeholder="tag1, tag2, ..." autocomplete="off">
+
+      <label for="add-license">License / rights</label>
+      <input id="add-license" class="form-field" type="text" placeholder="Unknown — verify rights before distribution" autocomplete="off">
+
+      <label for="add-transcript">Transcript</label>
+      <textarea id="add-transcript" class="form-field" rows="2"></textarea>
+
+      <label for="add-description">Description</label>
+      <textarea id="add-description" class="form-field" rows="2"></textarea>
+    </div>
+    <p class="edit-hint">New imports are flagged for review until their source, rights, and audio quality are checked. The original filename is used to create a safe filename within the selected category.</p>
+    <p id="add-error" class="del-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="add-cancel" class="btn" type="button">Cancel</button>
+      <button id="add-submit" class="btn play-btn" type="submit">Add WAV</button>
     </div>
   </form>
 </dialog>
@@ -1146,7 +1196,7 @@ pre.json-dump {
     selectedIndex: -1,
     playingFile: null,
     loop: false,
-    favorites: new Set(JSON.parse(localStorage.getItem("samplepack_favs") || "[]")),
+    favorites: new Set(),
   };
 
   const els = {
@@ -1221,6 +1271,24 @@ pre.json-dump {
     editError: document.getElementById("edit-error"),
     editCancel: document.getElementById("edit-cancel"),
     editSave: document.getElementById("edit-save"),
+    addSampleBtn: document.getElementById("add-sample-btn"),
+    addDialog: document.getElementById("add-dialog"),
+    addClose: document.getElementById("add-close"),
+    addCancel: document.getElementById("add-cancel"),
+    addForm: document.getElementById("add-form"),
+    addAudio: document.getElementById("add-audio"),
+    addName: document.getElementById("add-name"),
+    addCategory: document.getElementById("add-category"),
+    addCatDatalist: document.getElementById("add-cat-datalist"),
+    addRole: document.getElementById("add-role"),
+    addRoleDatalist: document.getElementById("add-role-datalist"),
+    addUse: document.getElementById("add-use"),
+    addTags: document.getElementById("add-tags"),
+    addLicense: document.getElementById("add-license"),
+    addTranscript: document.getElementById("add-transcript"),
+    addDescription: document.getElementById("add-description"),
+    addError: document.getElementById("add-error"),
+    addSubmit: document.getElementById("add-submit"),
     catDatalist: document.getElementById("cat-datalist"),
     roleDatalist: document.getElementById("role-datalist"),
     serverShutdownBtn: document.getElementById("server-shutdown-btn"),
@@ -1265,6 +1333,14 @@ pre.json-dump {
     }[ch]));
   }
 
+  function packPath(file) {
+    return `samplepack/samples/${file}`;
+  }
+
+  function audioUrl(file) {
+    return encodeURI(`samples/${file}`);
+  }
+
   function toDb(lin) {
     if (!lin || lin <= 1e-6) return "-∞ dB";
     return (20 * Math.log10(lin)).toFixed(1) + " dB";
@@ -1292,8 +1368,19 @@ pre.json-dump {
     }
   }
 
-  function saveFavs() {
-    localStorage.setItem("samplepack_favs", JSON.stringify([...state.favorites]));
+  async function saveFavorite(file, favorite) {
+    const res = await fetch("./api/favorite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file, favorite }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data || data.ok !== true) {
+      throw new Error((data && data.error) || `HTTP ${res.status}`);
+    }
+  }
+
+  function updateFavoriteCount() {
     els.statFavs.textContent = state.favorites.size;
   }
 
@@ -1487,7 +1574,7 @@ pre.json-dump {
         <div class="card-title-row">
           <div>
             <h2>${esc(s.name)}${s.reviewed ? ` <span class="reviewed-check" title="Reviewed &amp; approved">✓</span>` : ""}</h2>
-            <div class="file-path">samplepack/${esc(s.file)}</div>
+            <div class="file-path">${esc(packPath(s.file))}</div>
           </div>
         </div>
         ${s.transcript ? `
@@ -1517,7 +1604,7 @@ pre.json-dump {
           ${s.transcript ? `<button class="btn btn-sm" type="button" data-action="copy-transcript">Copy Quote</button>` : ""}
           <button class="btn btn-sm" type="button" data-action="edit">✎ Edit</button>
           <button class="btn btn-sm" type="button" data-action="prov">Provenance</button>
-          <a class="btn btn-sm" href="${encodeURI(s.file)}" download style="text-decoration:none">WAV ↓</a>
+          <a class="btn btn-sm" href="${audioUrl(s.file)}" download style="text-decoration:none">WAV ↓</a>
         </div>
       `;
 
@@ -1572,7 +1659,7 @@ pre.json-dump {
           e.stopPropagation();
           const act = actEl.dataset.action;
           if (act === "play") togglePlaySample(idx);
-          else if (act === "copy-path") copyText(`samplepack/${s.file}`, "sample path");
+          else if (act === "copy-path") copyText(packPath(s.file), "sample path");
           else if (act === "copy-transcript") copyText(s.transcript, "transcript");
           else if (act === "edit") openEditSample(s);
           else if (act === "prov") openProvenanceModal(s);
@@ -1628,7 +1715,7 @@ pre.json-dump {
         <td><button class="thumbs-btn thumbs-down-btn ${s.revisit ? "active" : ""}" type="button" data-action="thumbs-down" title="${s.revisit ? `Flagged: ${esc(s.revisit_reason || 'Needs review')}` : 'Needs action: delete, flag, or edit (👎)'}">👎</button></td>
         <td><span class="badge cat" data-cat="${esc(s.category)}">${esc(s.category)}</span></td>
         <td><span class="badge">${esc(s.role)}</span></td>
-        <td><strong>${esc(s.name)}</strong>${s.reviewed ? ` <span class="reviewed-check" title="Reviewed &amp; approved">✓</span>` : ""}<div class="file-path">samplepack/${esc(s.file)}</div></td>
+        <td><strong>${esc(s.name)}</strong>${s.reviewed ? ` <span class="reviewed-check" title="Reviewed &amp; approved">✓</span>` : ""}<div class="file-path">${esc(packPath(s.file))}</div></td>
         <td>${s.transcript ? `“${esc(s.transcript)}”` : (s.description ? esc(s.description) : "—")}</td>
         <td>${s.duration.toFixed(2)}s</td>
         <td>${toDb(s.peak)}</td>
@@ -1652,7 +1739,7 @@ pre.json-dump {
           if (act.dataset.action === "play") togglePlaySample(idx);
           else if (act.dataset.action === "thumbs-up") toggleReviewed(s);
           else if (act.dataset.action === "thumbs-down" || act.dataset.action === "flag") openThumbsDownDialog(s);
-          else if (act.dataset.action === "copy-path") copyText(`samplepack/${s.file}`, "sample path");
+          else if (act.dataset.action === "copy-path") copyText(packPath(s.file), "sample path");
           else if (act.dataset.action === "edit") openEditSample(s);
           else if (act.dataset.action === "prov") openProvenanceModal(s);
           else if (act.dataset.action === "delete") askDeleteSample(s);
@@ -1666,10 +1753,12 @@ pre.json-dump {
   }
 
   function toggleFav(file) {
-    if (state.favorites.has(file)) state.favorites.delete(file);
-    else state.favorites.add(file);
-    saveFavs();
+    const favorite = !state.favorites.has(file);
+    if (favorite) state.favorites.add(file);
+    else state.favorites.delete(file);
+    updateFavoriteCount();
     applyFilters();
+    saveFavorite(file, favorite).catch((err) => showToast(`Favorite error: ${err.message || err}`));
   }
 
   function selectSample(idx, autoPlay = false) {
@@ -1702,7 +1791,7 @@ pre.json-dump {
 
   function playSample(s) {
     state.playingFile = s.file;
-    audio.src = encodeURI(s.file);
+    audio.src = audioUrl(s.file);
     audio.loop = state.loop;
     audio.volume = parseFloat(els.volSlider.value);
     audio.play().catch(() => {});
@@ -1716,7 +1805,7 @@ pre.json-dump {
     els.npTitle.textContent = `${s.name}  [${s.category} · ${s.role}]`;
     els.npSub.textContent = s.transcript
       ? `“${s.transcript}”`
-      : (s.description || `samplepack/${s.file}`);
+      : (s.description || packPath(s.file));
     els.npTelemetry.textContent =
       `Peak ${toDb(s.peak)} · RMS ${toDb(s.rms)} · Centroid ${s.centroid_hz ? Math.round(s.centroid_hz) + " Hz" : "—"} · ${s.license || "Original synthesis"}`;
     if (els.npThumbsUpBtn) {
@@ -1765,7 +1854,7 @@ pre.json-dump {
   async function loadWaveformFor(file) {
     try {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const res = await fetch(encodeURI(file));
+      const res = await fetch(audioUrl(file));
       const buf = await res.arrayBuffer();
       const decoded = await audioCtx.decodeAudioData(buf);
       const ch0 = decoded.getChannelData(0);
@@ -1865,10 +1954,10 @@ pre.json-dump {
 
   function openProvenanceModal(s) {
     els.modalTitle.textContent = s.name;
-    els.modalFile.textContent = `samplepack/${s.file}`;
+    els.modalFile.textContent = packPath(s.file);
     const p = s.provenance || {};
     const rows = [
-      ["Pack Path", `<code>samplepack/${s.file}</code>`],
+      ["Pack Path", `<code>${esc(packPath(s.file))}</code>`],
       ["Category / Role", `${s.category} / ${s.role} (${(s.use || []).join(", ")})`],
       ["Format", `${s.sr} Hz · ${s.bit_depth}-bit · ${s.channels} ch · ${s.duration.toFixed(3)}s`],
       ["Levels", `Peak ${s.peak} (${toDb(s.peak)}) · RMS ${s.rms} (${toDb(s.rms)}) · Crest ${s.crest}`],
@@ -1901,7 +1990,7 @@ pre.json-dump {
     if (!s || deleting) return;
     deleteTarget = s;
     els.delTitle.textContent = `Delete ${s.name}?`;
-    els.delFile.textContent = `samplepack/${s.file}`;
+    els.delFile.textContent = packPath(s.file);
     els.delError.textContent = "";
     els.delError.hidden = true;
     els.delConfirm.disabled = false;
@@ -1926,7 +2015,8 @@ pre.json-dump {
 
   function removeSampleFromState(file) {
     if (state.playingFile === file) resetPlayer();
-    if (state.favorites.delete(file)) saveFavs();
+    state.favorites.delete(file);
+    updateFavoriteCount();
 
     state.samples = state.samples.filter((s) => s.file !== file);
     state.filtered = state.filtered.filter((s) => s.file !== file);
@@ -2027,12 +2117,14 @@ pre.json-dump {
     const roles = [...new Set(state.samples.map((s) => s.role).filter(Boolean))].sort();
     fillDatalist(els.catDatalist, categories);
     fillDatalist(els.roleDatalist, roles);
+    fillDatalist(els.addCatDatalist, categories);
+    fillDatalist(els.addRoleDatalist, roles);
   }
 
   function openEditSample(s) {
     if (!s || savingEdit) return;
     editTarget = s;
-    els.editFile.textContent = `samplepack/${s.file}`;
+    els.editFile.textContent = packPath(s.file);
     els.editName.value = s.name || "";
     els.editCategory.value = s.category || "";
     els.editRole.value = s.role || "";
@@ -2088,7 +2180,7 @@ pre.json-dump {
       const wasPlaying = !audio.paused;
       const resumeAt = audio.currentTime || 0;
       state.playingFile = newSample.file;
-      audio.src = encodeURI(newSample.file);
+      audio.src = audioUrl(newSample.file);
       if (wasPlaying) {
         const resume = () => {
           try {
@@ -2108,7 +2200,7 @@ pre.json-dump {
       state.favorites.delete(oldFile);
       state.favorites.add(newSample.file);
     }
-    saveFavs();
+    updateFavoriteCount();
 
     els.statTotal.textContent = state.samples.length;
     els.statCats.textContent = new Set(state.samples.map((s) => s.category)).size;
@@ -2190,6 +2282,88 @@ pre.json-dump {
     if (!savingEdit) editTarget = null;
   });
 
+  function openAddDialog() {
+    els.addForm.reset();
+    els.addError.hidden = true;
+    els.addError.textContent = "";
+    els.addCategory.value = state.category || "";
+    els.addRole.value = state.role || "";
+    els.addLicense.value = "Unknown — verify rights before distribution";
+    els.addSubmit.disabled = false;
+    els.addSubmit.textContent = "Add WAV";
+    refreshEditDatalists();
+    els.addDialog.showModal();
+    els.addAudio.focus();
+  }
+
+  els.addSampleBtn.addEventListener("click", openAddDialog);
+  els.addClose.addEventListener("click", () => els.addDialog.close());
+  els.addCancel.addEventListener("click", () => els.addDialog.close());
+  els.addDialog.addEventListener("click", (event) => {
+    if (event.target === els.addDialog) els.addDialog.close();
+  });
+  els.addAudio.addEventListener("change", () => {
+    const file = els.addAudio.files?.[0];
+    if (!file) return;
+    const proposed = file.name.replace(/\.wav$/i, "").replace(/[_-]+/g, " ").trim();
+    if (!els.addName.value || els.addName.value === els.addName.dataset.autoName) {
+      els.addName.value = proposed;
+    }
+    els.addName.dataset.autoName = proposed;
+  });
+
+  els.addForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const audioFile = els.addAudio.files?.[0];
+    if (!audioFile) {
+      els.addError.textContent = "Choose a WAV file first.";
+      els.addError.hidden = false;
+      return;
+    }
+    els.addSubmit.disabled = true;
+    els.addSubmit.textContent = "Adding…";
+    els.addError.hidden = true;
+    const body = new FormData();
+    body.append("audio", audioFile);
+    body.append("name", els.addName.value);
+    body.append("category", els.addCategory.value);
+    body.append("role", els.addRole.value);
+    body.append("suggested_use", els.addUse.value);
+    body.append("tags", els.addTags.value);
+    body.append("license", els.addLicense.value);
+    body.append("transcript", els.addTranscript.value);
+    body.append("description", els.addDescription.value);
+    try {
+      const res = await fetch("./api/add", { method: "POST", body });
+      const data = await res.json();
+      if (!res.ok || !data || data.ok !== true) {
+        throw new Error((data && data.error) || `HTTP ${res.status}`);
+      }
+      const sample = { ...data.sample, _searchBlob: buildSearchBlob(data.sample) };
+      state.samples.push(sample);
+      if (state.catalog) {
+        state.catalog.samples.push(data.sample);
+        state.catalog.count = state.samples.length;
+        state.catalog.categories = [...new Set(state.samples.map((s) => s.category))].sort();
+      }
+      els.statTotal.textContent = state.samples.length;
+      els.statCats.textContent = new Set(state.samples.map((s) => s.category)).size;
+      els.statRoles.textContent = new Set(state.samples.map((s) => s.role).filter(Boolean)).size;
+      updateCounts();
+      refreshFilterOptions();
+      applyFilters();
+      els.addDialog.close();
+      els.addForm.reset();
+      showToast(`Added ${sample.name}; flagged for review`);
+    } catch (err) {
+      els.addError.textContent = `Add failed: ${err.message || err}`;
+      els.addError.hidden = false;
+    } finally {
+      els.addSubmit.disabled = false;
+      els.addSubmit.textContent = "Add WAV";
+    }
+  });
+
   // Review & Revisit Functions
   function updateCounts() {
     const reviewed = state.samples.filter((s) => !!s.reviewed);
@@ -2205,7 +2379,7 @@ pre.json-dump {
   function openThumbsDownDialog(s) {
     if (!s) return;
     actionTarget = s;
-    if (els.tdFile) els.tdFile.textContent = `samplepack/${s.file}`;
+    if (els.tdFile) els.tdFile.textContent = packPath(s.file);
     if (els.thumbsDownDialog) {
       els.thumbsDownDialog.showModal();
     }
@@ -2268,7 +2442,7 @@ pre.json-dump {
   function openRevisitDialog(s) {
     if (!s || savingRevisit) return;
     revisitTarget = s;
-    if (els.revisitFile) els.revisitFile.textContent = `samplepack/${s.file}`;
+    if (els.revisitFile) els.revisitFile.textContent = packPath(s.file);
     if (els.revisitReason) els.revisitReason.value = s.revisit_reason || "";
     if (els.revisitUnflag) els.revisitUnflag.hidden = !s.revisit;
     if (els.revisitDialog) {
@@ -2526,10 +2700,22 @@ pre.json-dump {
   if (els.serverShutdownBtn) {
     els.serverShutdownBtn.addEventListener("click", async () => {
       if (!confirm("Are you sure you want to shut down the samplepack server?")) return;
+      els.serverShutdownBtn.disabled = true;
+      els.serverShutdownBtn.textContent = "Shutting down...";
       try {
-        els.serverShutdownBtn.disabled = true;
-        els.serverShutdownBtn.textContent = "Shutting down...";
-        await fetch("/api/shutdown", { method: "POST" });
+        const res = await fetch("/api/shutdown", {
+          method: "POST",
+          headers: { "Accept": "application/json" },
+        });
+        let data = null;
+        try {
+          data = await res.json();
+        } catch {
+          data = null;
+        }
+        if (!res.ok || !data || data.ok !== true) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
         showToast("Server shut down. You may close this tab.");
         document.body.innerHTML = `
           <div style="min-height:100vh;display:grid;place-content:center;text-align:center;font-family:var(--sans);padding:2rem">
@@ -2538,8 +2724,10 @@ pre.json-dump {
             <div style="color:var(--muted);font-size:0.85rem">To start it again, double-click <code>launch.sh</code> or <code>Samplepack Browser.desktop</code> in Nemo.</div>
           </div>
         `;
-      } catch {
-        showToast("Server has shut down.");
+      } catch (err) {
+        els.serverShutdownBtn.disabled = false;
+        els.serverShutdownBtn.textContent = "⏹ Shutdown Server";
+        showToast(`Shutdown failed: ${err && err.message ? err.message : err}`);
       }
     });
   }
@@ -2599,7 +2787,7 @@ pre.json-dump {
   });
   els.npCopyBtn.addEventListener("click", () => {
     const s = state.filtered[state.selectedIndex];
-    if (s) copyText(`samplepack/${s.file}`, "sample path");
+    if (s) copyText(packPath(s.file), "sample path");
   });
   els.npInfoBtn.addEventListener("click", () => {
     const s = state.filtered[state.selectedIndex];
@@ -2619,7 +2807,7 @@ pre.json-dump {
       els.search.blur();
       return;
     }
-    if (inInput || els.provDialog.open || els.deleteDialog.open || els.editDialog.open || (els.revisitDialog && els.revisitDialog.open) || (els.thumbsDownDialog && els.thumbsDownDialog.open)) return;
+    if (inInput || els.provDialog.open || els.deleteDialog.open || els.editDialog.open || els.addDialog.open || (els.revisitDialog && els.revisitDialog.open) || (els.thumbsDownDialog && els.thumbsDownDialog.open)) return;
 
     if (e.code === "Space") {
       e.preventDefault();
@@ -2655,11 +2843,38 @@ pre.json-dump {
     }
   });
 
+  async function loadFavoriteState() {
+    let legacy = [];
+    try {
+      const stored = JSON.parse(localStorage.getItem("samplepack_favs") || "[]");
+      if (Array.isArray(stored)) legacy = stored.filter((file) => typeof file === "string");
+    } catch {
+      legacy = [];
+    }
+    const catalogFiles = new Set(state.samples.map((sample) => sample.file));
+    legacy = legacy.filter((file) => catalogFiles.has(file));
+    if (legacy.length) {
+      const imported = await fetch("./api/favorites/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: legacy }),
+      });
+      if (!imported.ok) throw new Error("Could not migrate browser favorites into SQLite.");
+    }
+    localStorage.removeItem("samplepack_favs");
+    const response = await fetch("./api/favorites", { cache: "no-store" });
+    const result = await response.json();
+    if (!response.ok || !result || result.ok !== true) throw new Error("Could not load SQLite favorites.");
+    return result.files || [];
+  }
+
   async function init() {
     try {
-      const res = await fetch("./catalog.json", { cache: "no-store" });
+      const res = await fetch("./api/catalog", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const cat = await res.json();
       state.catalog = cat;
+      state.favorites = new Set(await loadFavoriteState());
       state.samples = (cat.samples || []).map((s) => ({
         ...s,
         _searchBlob: buildSearchBlob(s),
@@ -2692,7 +2907,7 @@ pre.json-dump {
       if (state.role) els.roleSelect.value = state.role;
       applyFilters();
     } catch (err) {
-      els.desc.textContent = "Failed to load catalog.json. Start the browser via ./launch.sh.";
+      els.desc.textContent = "Failed to load the SQLite sample catalog. Start the browser via ./launch.sh.";
       console.error(err);
     }
   }

@@ -30,6 +30,7 @@
 
 # Exclude instance-specific collection data, catalogs, and manifests
 catalog.json
+catalog.sqlite3*
 INDEX.md
 manifest.txt
 revisit_list.json
@@ -49,3 +50,6 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# The audio library remains local to this workspace.
+/samples/

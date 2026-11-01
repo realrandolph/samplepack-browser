@@ -1,231 +1,189 @@
 #!/usr/bin/env python3
-"""Static samplepack browser plus small sample edit/delete APIs.
-
-Serves this directory like ``python3 -m http.server`` and adds:
-
-    POST   /api/edit      PUT /api/sample   edit metadata (and category)
-    POST   /api/delete    DELETE /api/sample   delete a sample
-
-Delete accepts a JSON body ``{"file": "<path relative to samplepack/>"}``.
-Edit accepts the same ``file`` plus the metadata fields ``name``,
-``category``, ``role``, ``suggested_use``, ``tags``, ``transcript`` and
-``description``. Renaming the category moves the WAV into the new
-category directory; every generated index follows the move.
-"""
+"""Local sample browser API backed by SQLite and file-based WAV assets."""
 
 from __future__ import annotations
 
+import io
 import json
+import mimetypes
 import os
 import re
+import shutil
 import struct
-import sys
 import tempfile
 import threading
-from collections import Counter
-from datetime import datetime
+import wave
+from email import policy
+from email.parser import BytesParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import unquote_to_bytes, urlsplit
 
-PACK_DIR = Path(__file__).resolve().parent
-CATALOG_PATH = PACK_DIR / "catalog.json"
+import catalog_db
+import mcp_protocol
+
+PACK_DIR = catalog_db.PACK_DIR
+SAMPLES_DIR = catalog_db.SAMPLES_DIR
 PROVENANCE_PATH = PACK_DIR / "source" / "archival" / "provenance.json"
-INDEX_PATH = PACK_DIR / "INDEX.md"
-MANIFEST_PATH = PACK_DIR / "manifest.txt"
-REVISIT_JSON_PATH = PACK_DIR / "revisit_list.json"
-REVISIT_TXT_PATH = PACK_DIR / "revisit_list.txt"
-
 MAX_BODY_BYTES = 64 * 1024
-MUTATION_LOCK = threading.Lock()
-FORBIDDEN_PARTS = {"source", ".git"}
+MAX_UPLOAD_BYTES = 128 * 1024 * 1024
+MUTATION_LOCK = threading.RLock()
 SAFE_CATEGORY_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 TAG_SPLIT_RE = re.compile(r"[,;\n]+")
 USLT_CHUNK_IDS = (b"id3 ", b"ID3 ")
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/icon.png": "icon.png"}
+JSON_MUTATION_ROUTES = frozenset({
+    "/api/edit", "/api/sample", "/api/delete", "/api/revisit", "/api/flag",
+    "/api/review", "/api/approve", "/api/favorite", "/api/favorites/import",
+})
 
 
-class DeleteError(Exception):
-    """A client-visible validation or processing error.
-
-    The name predates editing support; both APIs raise it so the HTTP
-    handler can map it to a status code in one place.
-    """
-
+class APIError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
 
 
-# Editing shares the same error contract as deletion.
-EditError = DeleteError
-
-
-def slugify(value: str) -> str:
-    """Collapse text into the lowercase underscore slugs used by catalog uses."""
-    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_")
-
-
 def clean_text(raw: object, field: str, required: bool = False) -> str:
-    """Validate and trim one optional or required string field."""
     if raw is None:
         if required:
-            raise EditError(f"'{field}' is required")
+            raise APIError(f"'{field}' is required")
         return ""
     if not isinstance(raw, str):
-        raise EditError(f"'{field}' must be a string")
+        raise APIError(f"'{field}' must be a string")
     value = raw.strip()
     if required and not value:
-        raise EditError(f"'{field}' is required")
+        raise APIError(f"'{field}' is required")
     return value
 
 
 def clean_tags(raw: object) -> list[str]:
-    """Normalize tags given as a list or a comma/semicolon/newline string."""
     if raw is None:
         return []
     if isinstance(raw, str):
-        parts: list[str] = TAG_SPLIT_RE.split(raw)
+        parts = TAG_SPLIT_RE.split(raw)
     elif isinstance(raw, list):
         parts = []
-        for item in raw:
-            if not isinstance(item, str):
-                raise EditError("'tags' must contain strings")
-            parts.extend(TAG_SPLIT_RE.split(item))
+        for value in raw:
+            if not isinstance(value, str):
+                raise APIError("'tags' must contain strings")
+            parts.extend(TAG_SPLIT_RE.split(value))
     else:
-        raise EditError("'tags' must be a list or a comma-separated string")
-
-    tags: list[str] = []
+        raise APIError("'tags' must be a list or a comma-separated string")
     seen: set[str] = set()
+    result = []
     for part in parts:
         tag = part.strip().lstrip("#").strip()
-        if not tag:
-            continue
-        key = tag.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        tags.append(tag)
-    return tags
+        if tag and tag.casefold() not in seen:
+            result.append(tag)
+            seen.add(tag.casefold())
+    return result
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.casefold())).strip("_")
 
 
 def validate_category(raw: object) -> str:
-    """Return a clean category directory slug or raise EditError."""
-    if not isinstance(raw, str):
-        raise EditError("'category' must be a string")
-    category = raw.strip()
-    if not category:
-        raise EditError("'category' is required")
-    if not SAFE_CATEGORY_RE.match(category):
-        raise EditError(
-            "'category' must be a simple directory slug using letters, digits, '-' or '_'"
-        )
-    if category.lower() in FORBIDDEN_PARTS:
-        raise EditError("'category' must not be source or .git")
+    category = clean_text(raw, "category", required=True).lower()
+    if not SAFE_CATEGORY_RE.fullmatch(category) or category.casefold() in {"source", "work", ".git", "samples"}:
+        raise APIError("category must be a simple folder name using letters, digits, '-' or '_'")
     return category
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    """Write text to *path* via a same-directory temporary file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    tmp_path = Path(tmp_name)
+def sample_path(file_name: object, *, must_exist: bool = True) -> tuple[str, Path]:
+    relative = catalog_db.normalize_file(file_name)
+    target = (SAMPLES_DIR / Path(*PurePosixPath(relative).parts)).resolve()
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
+        target.relative_to(SAMPLES_DIR.resolve())
+    except ValueError:
+        raise APIError("sample path escapes samples/") from None
+    if must_exist and not target.is_file():
+        raise APIError(f"sample file does not exist: {relative}", status=404)
+    return relative, target
+
+
+def decode_request_path(route: str) -> str:
+    """Decode one URL path and reject encoded control, backslash, or traversal tricks."""
+    try:
+        decoded = unquote_to_bytes(route).decode("utf-8")
+    except UnicodeDecodeError:
+        raise APIError("request path is not valid UTF-8", status=400) from None
+    if not decoded.startswith("/") or "\x00" in decoded or "\\" in decoded:
+        raise APIError("invalid request path", status=400)
+    return decoded
+
+
+def static_file(route: str) -> Path | None:
+    """Resolve an allowed static file: the browser shell, its icon, or a WAV under samples/."""
+    decoded = decode_request_path(route)
+    if decoded in STATIC_FILES:
+        return PACK_DIR / STATIC_FILES[decoded]
+    if not decoded.startswith("/samples/"):
+        return None
+    parts = PurePosixPath(decoded).parts
+    if any(part in ("", ".", "..") for part in parts[1:]):
+        return None
+    relative = PurePosixPath(*parts[1:])
+    if len(relative.parts) < 2 or relative.suffix.lower() != ".wav":
+        return None
+    target = (PACK_DIR / Path(*relative.parts)).resolve()
+    try:
+        target.relative_to(SAMPLES_DIR.resolve())
+    except ValueError:
+        return None
+    return target if target.is_file() else None
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        os.replace(temp_name, path)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        Path(temp_name).unlink(missing_ok=True)
         raise
 
 
-def atomic_write_json(path: Path, data: object) -> None:
-    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-
-
-def validate_rel_file(raw: object) -> str:
-    """Return a normalized pack-relative WAV path or raise DeleteError."""
-    if not isinstance(raw, str):
-        raise DeleteError("'file' must be a string")
-    rel = raw.strip().replace("\\", "/")
-    if not rel:
-        raise DeleteError("'file' is required")
-    if "\x00" in rel:
-        raise DeleteError("'file' contains a NUL byte")
-    if rel.startswith("/"):
-        raise DeleteError("'file' must be relative to samplepack/")
-
-    rel_path = PurePosixPath(rel)
-    if rel_path.is_absolute() or any(part in ("", ".", "..") for part in rel_path.parts):
-        raise DeleteError("'file' contains an invalid path segment")
-    if rel_path.suffix.lower() != ".wav":
-        raise DeleteError("'file' must end with .wav")
-    if any(part in FORBIDDEN_PARTS for part in rel_path.parts):
-        raise DeleteError("'file' must not point into source/ or .git/")
-
-    target = (PACK_DIR / Path(*rel_path.parts)).resolve()
-    try:
-        target.relative_to(PACK_DIR)
-    except ValueError:
-        raise DeleteError("'file' escapes the samplepack directory") from None
-    if target.exists() and not target.is_file():
-        raise DeleteError("'file' is not a regular file")
-
-    return target.relative_to(PACK_DIR).as_posix()
-
-
 def read_wav_chunks(path: Path) -> tuple[list[tuple[bytes, bytes]], bytes]:
-    """Return ``(chunks, trailing_bytes)`` for a RIFF/WAVE file.
-
-    Each chunk is ``(id, payload)`` with the RIFF pad byte removed. Any bytes
-    after the last complete chunk are returned untouched so a rewrite does not
-    drop them.
-    """
     data = path.read_bytes()
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        raise EditError("file is not a RIFF/WAVE audio file")
-
+        raise APIError("file is not a RIFF/WAVE audio file")
     chunks: list[tuple[bytes, bytes]] = []
     pos = 12
-    total = len(data)
-    while pos + 8 <= total:
+    while pos + 8 <= len(data):
         chunk_id = data[pos:pos + 4]
         size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
         start = pos + 8
         end = start + size
-        if end > total:
-            raise EditError("file is a truncated or corrupt WAV")
+        if end > len(data):
+            raise APIError("file is a truncated or corrupt WAV")
         chunks.append((chunk_id, data[start:end]))
         pos = end + (size & 1)
-    tail = data[pos:]
-    return chunks, tail
+    return chunks, data[pos:]
+
+
+def _pack_chunk(chunk_id: bytes, payload: bytes) -> bytes:
+    return chunk_id + struct.pack("<I", len(payload)) + payload + (b"\x00" if len(payload) & 1 else b"")
 
 
 def build_uslt_tag(transcript: str) -> bytes:
-    """Build an ID3v2.3 tag holding one UTF-16 USLT frame.
-
-    Matches the frame layout already used across the pack: encoding byte 0x01,
-    language ``eng``, empty content descriptor, then the transcript.
-    """
     body = b"\x01eng\xff\xfe\x00\x00" + transcript.encode("utf-16")
     frame = b"USLT" + struct.pack(">I", len(body)) + b"\x00\x00" + body
     tag_size = len(frame)
-    syncsafe = bytes((
-        (tag_size >> 21) & 0x7F,
-        (tag_size >> 14) & 0x7F,
-        (tag_size >> 7) & 0x7F,
-        tag_size & 0x7F,
-    ))
+    syncsafe = bytes(((tag_size >> 21) & 0x7f, (tag_size >> 14) & 0x7f,
+                      (tag_size >> 7) & 0x7f, tag_size & 0x7f))
     return b"ID3\x03\x00\x00" + syncsafe + frame
 
 
 def write_wav_uslt(path: Path, transcript: str) -> None:
-    """Set (or remove, when *transcript* is empty) the WAV's USLT tag."""
     chunks, tail = read_wav_chunks(path)
     replacement = build_uslt_tag(transcript) if transcript else None
-
     out: list[bytes] = []
     used = False
     for chunk_id, payload in chunks:
@@ -237,824 +195,541 @@ def write_wav_uslt(path: Path, transcript: str) -> None:
         out.append(_pack_chunk(chunk_id, payload))
     if replacement is not None and not used:
         out.append(_pack_chunk(b"id3 ", replacement))
-
     body = b"".join(out) + tail
-    data = b"RIFF" + struct.pack("<I", len(body) + 4) + b"WAVE" + body
-    tmp_path = path.with_name(f".{path.name}.edit.tmp")
+    atomic_write_bytes(path, b"RIFF" + struct.pack("<I", len(body) + 4) + b"WAVE" + body)
+
+
+def analyze_uploaded_wav(data: bytes) -> dict[str, Any]:
     try:
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        with wave.open(io.BytesIO(data), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_rate = wav.getframerate()
+            width = wav.getsampwidth()
+            frames = wav.getnframes()
+            if wav.getcomptype() != "NONE":
+                raise APIError("uploaded WAV must use uncompressed PCM")
+            if channels != 2 or sample_rate != 48000 or width != 3:
+                raise APIError("uploaded WAV must be stereo, 48000 Hz, 24-bit PCM")
+            if frames <= 0:
+                raise APIError("uploaded WAV contains no audio frames")
+            peak = 0
+            square_sum = 0
+            sample_count = 0
+            while True:
+                block = wav.readframes(16384)
+                if not block:
+                    break
+                for offset in range(0, len(block) - 2, 3):
+                    value = int.from_bytes(block[offset:offset + 3], "little", signed=False)
+                    if value & 0x800000:
+                        value -= 0x1000000
+                    magnitude = abs(value)
+                    peak = max(peak, magnitude)
+                    square_sum += value * value
+                    sample_count += 1
+    except APIError:
         raise
+    except (wave.Error, EOFError) as exc:
+        raise APIError(f"could not read uploaded WAV: {exc}") from None
+    peak_linear = peak / 8388608
+    rms_linear = (square_sum / sample_count) ** 0.5 / 8388608 if sample_count else 0
+    return {
+        "duration": frames / sample_rate,
+        "sr": sample_rate,
+        "channels": channels,
+        "bit_depth": width * 8,
+        "peak": round(peak_linear, 6),
+        "rms": round(rms_linear, 6),
+        "crest": round(peak_linear / rms_linear, 2) if rms_linear else None,
+        "centroid_hz": None,
+        "pitch": None,
+    }
 
 
-def _pack_chunk(chunk_id: bytes, payload: bytes) -> bytes:
-    padding = b"\x00" if len(payload) & 1 else b""
-    return chunk_id + struct.pack("<I", len(payload)) + payload + padding
-
-
-def read_catalog() -> dict:
-    """Load catalog.json or raise a 500-flavoured EditError."""
-    try:
-        with CATALOG_PATH.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except FileNotFoundError:
-        raise EditError("catalog.json not found", status=500) from None
-    except json.JSONDecodeError as exc:
-        raise EditError(f"catalog.json is not valid JSON: {exc}", status=500) from None
-
-
-def rebuild_catalog_totals(catalog: dict) -> None:
-    """Recompute count, categories, roles and uses from catalog["samples"]."""
-    samples = catalog.get("samples", [])
-    catalog["count"] = len(samples)
-    catalog["categories"] = sorted(
-        {s.get("category") for s in samples if s.get("category")}
-    )
-
-    roles: dict[str, list[str]] = {}
-    uses: dict[str, list[str]] = {}
-    for sample in samples:
-        file_name = sample.get("file")
-        if not file_name:
-            continue
-        role = sample.get("role")
-        if role:
-            roles.setdefault(role, []).append(file_name)
-        for use in sample.get("use", []) or []:
-            uses.setdefault(use, []).append(file_name)
-    catalog["roles"] = dict(sorted(roles.items()))
-    catalog["uses"] = dict(sorted(uses.items()))
-
-
-def prune_catalog(rel_file: str) -> dict:
-    """Remove the sample from catalog.json and return the updated catalog."""
-    catalog = read_catalog()
-    catalog["samples"] = [
-        s for s in catalog.get("samples", []) if s.get("file") != rel_file
-    ]
-    rebuild_catalog_totals(catalog)
-    atomic_write_json(CATALOG_PATH, catalog)
-    return catalog
-
-
-def prune_provenance(rel_file: str) -> None:
-    """Remove extract entries that point at the deleted pack file."""
+def _write_provenance_change(old_file: str, new_file: str | None = None,
+                             *, transcript: str | None = None,
+                             suggested_use: str | None = None) -> None:
     if not PROVENANCE_PATH.exists():
         return
     try:
-        with PROVENANCE_PATH.open("r", encoding="utf-8") as handle:
-            provenance = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DeleteError(f"could not read provenance.json: {exc}", status=500) from None
-
-    extracts = provenance.get("extracts")
-    if isinstance(extracts, list):
-        provenance["extracts"] = [
-            entry
-            for entry in extracts
-            if not (
-                isinstance(entry, dict)
-                and (
-                    entry.get("file") == rel_file
-                    or entry.get("pack_file") == rel_file
-                )
-            )
-        ]
-        atomic_write_json(PROVENANCE_PATH, provenance)
-
-
-def prune_index(rel_file: str, samples: list[dict]) -> None:
-    """Drop the INDEX.md row and refresh count, category and role totals."""
-    if not INDEX_PATH.exists():
+        document = json.loads(PROVENANCE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return
-    text = INDEX_PATH.read_text(encoding="utf-8")
-    lines = text.splitlines(keepends=True)
-
-    row_prefix = f"| `{rel_file}`"
-    kept = [
-        line
-        for line in lines
-        if not (line.lstrip().startswith(row_prefix) or row_prefix in line)
-    ]
-
-    category_counts = Counter(s.get("category") for s in samples if s.get("category"))
-    role_counts = Counter(s.get("role") for s in samples if s.get("role"))
-
-    updated: list[str] = []
-    for line in kept:
-        stripped = line.rstrip("\n")
-
-        if stripped.startswith("Count:"):
-            stripped = re.sub(
-                r"Count:\s*\*\*\d+\*\*\s+production files\.",
-                f"Count: **{len(samples)}** production files.",
-                stripped,
-            )
-        else:
-            category_match = re.match(r"^###\s+(\S+)\s+\(\d+\)\s*$", stripped)
-            if category_match:
-                category = category_match.group(1)
-                stripped = f"### {category} ({category_counts.get(category, 0)})"
-
-            role_match = re.match(r"^\|\s+`([^`]+)`\s+\|\s+\d+\s+\|", stripped)
-            if role_match:
-                role = role_match.group(1)
-                stripped = re.sub(
-                    r"^(\|\s+`" + re.escape(role) + r"`\s+\|\s+)\d+(\s+\|)",
-                    lambda m: f"{m.group(1)}{role_counts.get(role, 0)}{m.group(2)}",
-                    stripped,
-                )
-
-        updated.append(stripped + "\n")
-
-    atomic_write_text(INDEX_PATH, "".join(updated))
-
-
-def prune_manifest(rel_file: str, sample_count: int) -> None:
-    """Drop manifest lines mentioning the sample and refresh the total."""
-    if not MANIFEST_PATH.exists():
-        return
-    basename = PurePosixPath(rel_file).name
-    lines = MANIFEST_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
-    kept = [
-        line
-        for line in lines
-        if rel_file not in line and basename not in line
-    ]
-    text = re.sub(
-        r"\(\s*\d+\s+production files\s*\)",
-        f"({sample_count} production files)",
-        "".join(kept),
-    )
-    atomic_write_text(MANIFEST_PATH, text)
-
-
-def prune_revisit(rel_file: str) -> None:
-    """Remove a sample from revisit_list.json and revisit_list.txt."""
-    if not REVISIT_JSON_PATH.exists():
-        return
-    try:
-        data = json.loads(REVISIT_JSON_PATH.read_text(encoding="utf-8"))
-        samples = [s for s in data.get("samples", []) if s.get("file") != rel_file]
-        if len(samples) != len(data.get("samples", [])):
-            now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            data["count"] = len(samples)
-            data["updated"] = now_str
-            data["samples"] = samples
-            atomic_write_json(REVISIT_JSON_PATH, data)
-            txt_lines = [
-                "# Samplepack Revisit List",
-                "# Format: <file> | <reason> | <date>",
-                f"# Total flagged: {len(samples)} (Updated {now_str})",
-                "",
-            ]
-            for s in samples:
-                txt_lines.append(f"{s['file']} | {s.get('reason', '')} | {s.get('date', '')}")
-            REVISIT_TXT_PATH.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
-    except Exception:
-        pass
-
-
-def delete_sample(raw_file: object) -> dict:
-    """Delete one pack WAV and prune every generated index. Idempotent."""
-    rel_file = validate_rel_file(raw_file)
-    target = PACK_DIR / rel_file
-
-    with MUTATION_LOCK:
-        if target.exists():
-            try:
-                target.unlink()
-            except OSError as exc:
-                raise DeleteError(f"could not delete {rel_file}: {exc}", status=500) from None
-
-        catalog = prune_catalog(rel_file)
-        prune_provenance(rel_file)
-        prune_index(rel_file, catalog["samples"])
-        prune_manifest(rel_file, catalog["count"])
-        prune_revisit(rel_file)
-
-    return {"ok": True, "deleted": rel_file, "count": catalog["count"]}
-
-
-# ---------------------------------------------------------------------------
-# Editing
-# ---------------------------------------------------------------------------
-
-CATEGORY_HEADER_RE = re.compile(r"^###\s+(\S+)\s+\((\d+)\)\s*$")
-ROLE_ROW_RE = re.compile(r"^\|\s+`([^`]+)`\s+\|\s+\d+\s+\|(.*)\|\s*$")
-
-
-def _categories_region(lines: list[str]) -> tuple[int, int] | None:
-    """Return the line span holding every ``### category`` section."""
-    start = None
-    for i, line in enumerate(lines):
-        if line.startswith("## Categories"):
-            start = i + 1
-            break
-    if start is None:
-        return None
-    end = len(lines)
-    for i in range(start, len(lines)):
-        if lines[i].startswith("## "):
-            end = i
-            break
-    return start, end
-
-
-def _index_sections(
-    lines: list[str], start: int, end: int
-) -> tuple[list[str], list[dict]]:
-    """Split the category region into preamble lines and per-category sections."""
-    preamble: list[str] = []
-    sections: list[dict] = []
-    current: dict | None = None
-    for i in range(start, end):
-        line = lines[i]
-        header = CATEGORY_HEADER_RE.match(line.rstrip("\n"))
-        if header:
-            current = {"category": header.group(1), "head": [line], "rows": []}
-            sections.append(current)
-        elif current is None:
-            preamble.append(line)
-        elif line.lstrip().startswith("| `"):
-            current["rows"].append(line)
-        elif not current["rows"]:
-            current["head"].append(line)
-        # Blank separators after the rows are dropped and rebuilt on output.
-    return preamble, sections
-
-
-def _index_row_parts(line: str) -> tuple[str, str, str, str] | None:
-    """Return ``(file, dur, use, description)`` for one INDEX.md table row."""
-    parts = line.rstrip("\n").split("|")
-    if len(parts) < 6:
-        return None
-    rel = parts[1].strip().strip("`")
-    if not rel:
-        return None
-    return rel, parts[2].strip(), parts[3].strip(), "|".join(parts[4:-1]).strip()
-
-
-def _render_index_row(rel_file: str, sample: dict, fallback_description: str) -> str:
-    duration = sample.get("duration")
-    dur = f"{float(duration):.2f}" if isinstance(duration, (int, float)) else ""
-    uses = ",".join(sample.get("use") or [])
-    description = sample.get("description")
-    text = fallback_description if description is None else str(description)
-    text = text.replace("|", "\\|").replace("\n", " ").strip()
-    return f"| `{rel_file}` | {dur} | {uses} | {text} |\n"
-
-
-def _sorted_insert(rows: list[str], row: str, rel_file: str) -> None:
-    for i, existing in enumerate(rows):
-        parts = _index_row_parts(existing)
-        if parts and parts[0] > rel_file:
-            rows.insert(i, row)
-            return
-    rows.append(row)
-
-
-def edit_index(old_rel: str, new_rel: str, sample: dict, samples: list[dict]) -> None:
-    """Move/update the INDEX.md row and refresh every count."""
-    if not INDEX_PATH.exists():
-        return
-
-    lines = INDEX_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
-    category_counts = Counter(s.get("category") for s in samples if s.get("category"))
-    role_counts = Counter(s.get("role") for s in samples if s.get("role"))
-    region = _categories_region(lines)
-
-    if region is not None:
-        start, end = region
-        preamble, sections = _index_sections(lines, start, end)
-
-        old_section = old_row = None
-        old_description = ""
-        for si, section in enumerate(sections):
-            for ri, row in enumerate(section["rows"]):
-                parts = _index_row_parts(row)
-                if parts and parts[0] == old_rel:
-                    old_section, old_row = si, ri
-                    old_description = parts[3]
-                    break
-            if old_section is not None:
-                break
-
-        row = _render_index_row(new_rel, sample, old_description)
-        if old_section is not None and old_row is not None:
-            sections[old_section]["rows"].pop(old_row)
-
-        new_category = sample.get("category") or ""
-        target = next(
-            (s for s in sections if s["category"] == new_category), None
-        )
-        if target is None:
-            target = {
-                "category": new_category,
-                "head": [
-                    f"### {new_category} ({category_counts.get(new_category, 0)})\n",
-                    "\n",
-                    "| file | dur | use | description |\n",
-                    "|---|---:|---|---|\n",
-                ],
-                "rows": [],
-            }
-            position = len(sections)
-            for i, section in enumerate(sections):
-                if section["category"] > new_category:
-                    position = i
-                    break
-            sections.insert(position, target)
-
-        _sorted_insert(target["rows"], row, new_rel)
-
-        rebuilt = list(preamble)
-        for section in sections:
-            body = list(section["head"])
-            body[0] = (
-                f"### {section['category']} "
-                f"({category_counts.get(section['category'], 0)})\n"
-            )
-            rebuilt.extend(body)
-            rebuilt.extend(section["rows"])
-            rebuilt.append("\n")
-        lines = lines[:start] + rebuilt + lines[end:]
-
-    count_line = re.compile(r"Count:\s*\*\*\d+\*\*\s+production files\.")
-    updated: list[str] = []
-    in_roles = False
-    last_role_row = None
-    seen_roles: set[str] = set()
-    for line in lines:
-        stripped = line.rstrip("\n")
-        if stripped.startswith("## "):
-            in_roles = stripped.strip() == "## Roles"
-        if stripped.startswith("Count:"):
-            line = count_line.sub(
-                f"Count: **{len(samples)}** production files.", line, count=1
-            )
-        elif in_roles:
-            match = ROLE_ROW_RE.match(stripped)
-            if match:
-                role = match.group(1)
-                seen_roles.add(role)
-                last_role_row = len(updated)
-                line = f"| `{role}` | {role_counts.get(role, 0)} |{match.group(2)}|\n"
-        updated.append(line)
-
-    missing_roles = sorted(set(role_counts) - seen_roles)
-    if missing_roles and last_role_row is not None:
-        new_rows = [
-            f"| `{role}` | {role_counts[role]} |  |\n" for role in missing_roles
-        ]
-        updated[last_role_row + 1:last_role_row + 1] = new_rows
-
-    atomic_write_text(INDEX_PATH, "".join(updated))
-
-
-def edit_provenance(
-    old_rel: str,
-    new_rel: str,
-    transcript: str,
-    suggested_use: str,
-    transcript_provided: bool,
-    suggested_use_provided: bool,
-) -> None:
-    """Follow the moved file in provenance.json and refresh edited metadata."""
-    if not PROVENANCE_PATH.exists():
-        return
-    try:
-        with PROVENANCE_PATH.open("r", encoding="utf-8") as handle:
-            provenance = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise EditError(f"could not read provenance.json: {exc}", status=500) from None
-
-    extracts = provenance.get("extracts")
-    if not isinstance(extracts, list):
-        return
-
     changed = False
-    for entry in extracts:
-        if not isinstance(entry, dict):
+    for section in ("extracts", "full_sources"):
+        entries = document.get(section)
+        if not isinstance(entries, list):
             continue
-        if entry.get("file") != old_rel and entry.get("pack_file") != old_rel:
-            continue
-        entry["file"] = new_rel
-        entry["pack_file"] = new_rel
-        if transcript_provided:
-            if transcript:
-                entry["transcript"] = transcript
-            else:
-                entry.pop("transcript", None)
-        if suggested_use_provided:
-            if suggested_use:
-                entry["suggested_use"] = suggested_use
-            else:
-                entry.pop("suggested_use", None)
-        changed = True
-
+        kept = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            old_pack_path = f"samples/{old_file}"
+            refs = {entry.get("file"), entry.get("pack_file")}
+            if old_file not in refs and old_pack_path not in refs:
+                kept.append(entry)
+                continue
+            if new_file is None:
+                changed = True
+                continue
+            pack_path = f"samples/{new_file}"
+            if entry.get("file") in {old_file, old_pack_path}:
+                entry["file"] = pack_path
+            if entry.get("pack_file") in {old_file, old_pack_path}:
+                entry["pack_file"] = pack_path
+            if transcript is not None:
+                if transcript:
+                    entry["transcript"] = transcript
+                else:
+                    entry.pop("transcript", None)
+            if suggested_use is not None:
+                if suggested_use:
+                    entry["suggested_use"] = suggested_use
+                else:
+                    entry.pop("suggested_use", None)
+            kept.append(entry)
+            changed = True
+        document[section] = kept
     if changed:
-        atomic_write_json(PROVENANCE_PATH, provenance)
+        atomic_write_bytes(PROVENANCE_PATH, (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode())
 
 
-def edit_manifest(old_rel: str, new_rel: str) -> None:
-    """Point every manifest mention of the sample at its new path."""
-    if not MANIFEST_PATH.exists() or old_rel == new_rel:
-        return
-    text = MANIFEST_PATH.read_text(encoding="utf-8")
-    if old_rel not in text:
-        return
-    atomic_write_text(MANIFEST_PATH, text.replace(old_rel, new_rel))
-
-
-def edit_sample(payload: dict) -> dict:
-    """Apply an edit to one pack WAV and every generated index."""
-    old_rel = validate_rel_file(payload.get("file"))
-    source = PACK_DIR / old_rel
-    if not source.exists():
-        raise EditError(f"sample not found: {old_rel}", status=404)
-    if not source.is_file():
-        raise EditError(f"not a regular file: {old_rel}")
-
-    new_category = validate_category(payload.get("category"))
+def edit_sample(payload: dict[str, Any]) -> dict[str, Any]:
+    old_file, source = sample_path(payload.get("file"))
+    category = validate_category(payload.get("category"))
     name = clean_text(payload.get("name"), "name", required=True)
     role = clean_text(payload.get("role"), "role", required=True)
     tags = clean_tags(payload.get("tags"))
+    catalog = catalog_db.load_catalog()
+    entry = next((sample for sample in catalog["samples"] if sample["file"] == old_file), None)
+    if entry is None:
+        raise APIError(f"sample not found in catalog: {old_file}", status=404)
+
+    suggested_use = clean_text(payload["suggested_use"], "suggested_use") if "suggested_use" in payload else str(entry.get("suggested_use") or "")
+    transcript = clean_text(payload["transcript"], "transcript") if "transcript" in payload else str(entry.get("transcript") or "")
+    description = clean_text(payload["description"], "description") if "description" in payload else entry.get("description")
+    new_file = f"{category}/{PurePosixPath(old_file).name}"
+    _, destination = sample_path(new_file, must_exist=False)
+    moved = new_file != old_file
+    if moved and destination.exists():
+        raise APIError(f"destination already exists: {new_file}", status=409)
 
     with MUTATION_LOCK:
-        catalog = read_catalog()
-        samples = catalog.get("samples", [])
-        entry = next((s for s in samples if s.get("file") == old_rel), None)
-        if entry is None:
-            raise EditError(
-                f"sample not found in catalog.json: {old_rel}", status=404
-            )
-
-        if "suggested_use" in payload:
-            suggested_use = clean_text(payload["suggested_use"], "suggested_use")
-        else:
-            suggested_use = entry.get("suggested_use") or ""
-
         if "transcript" in payload:
-            transcript = clean_text(payload["transcript"], "transcript")
-        else:
-            transcript = entry.get("transcript") or ""
+            write_wav_uslt(source, transcript)
+        if moved:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(destination)
 
-        if "description" in payload:
-            description = clean_text(payload["description"], "description")
-        else:
-            description = entry.get("description")
-
-        old_category = entry.get("category")
-        if new_category != old_category:
-            new_rel = f"{new_category}/{PurePosixPath(old_rel).name}"
-            destination = PACK_DIR / new_rel
-            if destination.exists() and destination.resolve() != source.resolve():
-                raise EditError(
-                    f"destination already exists: {new_rel}", status=409
-                )
-        else:
-            new_rel = old_rel
-            destination = None
-
-        # Tag the WAV before moving it so a malformed file fails cleanly.
-        if "transcript" in payload:
-            try:
-                write_wav_uslt(source, transcript)
-            except EditError:
-                raise
-            except OSError as exc:
-                raise EditError(
-                    f"could not update WAV tags for {old_rel}: {exc}", status=500
-                ) from None
-
-        if destination is not None:
-            try:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                source.rename(destination)
-            except OSError as exc:
-                raise EditError(
-                    f"could not move {old_rel} to {new_rel}: {exc}", status=500
-                ) from None
-
-        entry["file"] = new_rel
-        entry["name"] = name
-        entry["category"] = new_category
-        entry["role"] = role
-        entry["tags"] = tags
-        entry["transcript"] = transcript
-        entry["description"] = description
-        entry["suggested_use"] = suggested_use
-
-        uses = [u for u in (entry.get("use") or []) if isinstance(u, str)]
+        entry.update({
+            "file": new_file, "name": name, "category": category, "role": role,
+            "tags": tags, "suggested_use": suggested_use, "transcript": transcript,
+            "description": description,
+        })
+        uses = [value for value in (entry.get("use") or []) if isinstance(value, str)]
         for candidate in (role, slugify(suggested_use)):
             if candidate and candidate not in uses:
                 uses.append(candidate)
         entry["use"] = uses
-
-        rebuild_catalog_totals(catalog)
-        atomic_write_json(CATALOG_PATH, catalog)
-
-        edit_provenance(
-            old_rel,
-            new_rel,
-            transcript,
-            suggested_use,
-            "transcript" in payload,
-            "suggested_use" in payload,
+        for sample in catalog["samples"]:
+            if sample.get("parent") == old_file:
+                sample["parent"] = new_file
+        try:
+            catalog_db.save_catalog(catalog)
+        except BaseException:
+            if moved and destination.exists():
+                destination.rename(source)
+            raise
+        _write_provenance_change(
+            old_file, new_file,
+            transcript=transcript if "transcript" in payload else None,
+            suggested_use=suggested_use if "suggested_use" in payload else None,
         )
-        edit_index(old_rel, new_rel, entry, samples)
-        edit_manifest(old_rel, new_rel)
-
-        return {"ok": True, "sample": entry, "count": catalog["count"]}
-
-
-def get_revisit_list() -> dict:
-    if not REVISIT_JSON_PATH.exists():
-        return {"ok": True, "count": 0, "samples": []}
-    try:
-        with open(REVISIT_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {
-                "ok": True,
-                "count": len(data.get("samples", [])),
-                "updated": data.get("updated"),
-                "samples": data.get("samples", []),
-            }
-    except Exception as exc:
-        return {"ok": True, "count": 0, "samples": [], "error": str(exc)}
+    updated = catalog_db.get_sample(new_file)
+    assert updated is not None
+    return updated
 
 
-def toggle_revisit(payload: dict) -> dict:
-    rel_path = (payload.get("file") or "").strip()
-    if not rel_path:
-        raise EditError("file path is required")
-    flagged = bool(payload.get("flagged", True))
-    reason = (payload.get("reason") or "").strip() or None
-
+def delete_sample(file_name: object) -> dict[str, Any]:
+    relative, target = sample_path(file_name, must_exist=False)
     with MUTATION_LOCK:
-        revisit_data = {"count": 0, "samples": []}
-        if REVISIT_JSON_PATH.exists():
+        tombstone = target.with_name(f".{target.name}.delete-pending")
+        if tombstone.exists():
+            raise APIError(f"delete recovery file already exists: {tombstone.name}", status=409)
+        moved = target.exists()
+        if moved:
+            target.rename(tombstone)
+        try:
+            if not catalog_db.delete_sample(relative):
+                raise APIError(f"sample not found in catalog: {relative}", status=404)
+        except BaseException:
+            if moved and tombstone.exists():
+                tombstone.rename(target)
+            raise
+        tombstone.unlink(missing_ok=True)
+        _write_provenance_change(relative)
+    return {"ok": True, "deleted": relative, "count": catalog_db.load_catalog()["count"]}
+
+
+def _decode_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], tuple[str, bytes]]:
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii", errors="strict")
+    message = BytesParser(policy=policy.default).parsebytes(header + body)
+    if not message.is_multipart():
+        raise APIError("upload must use multipart/form-data")
+    fields: dict[str, str] = {}
+    upload: tuple[str, bytes] | None = None
+    for part in message.iter_parts():
+        field_name = part.get_param("name", header="content-disposition")
+        if not field_name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename is not None:
+            if field_name == "audio":
+                upload = (filename, payload)
+        else:
+            charset = part.get_content_charset() or "utf-8"
             try:
-                revisit_data = json.loads(REVISIT_JSON_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                revisit_data = {"count": 0, "samples": []}
-
-        existing_samples = [s for s in revisit_data.get("samples", []) if s.get("file") != rel_path]
-
-        now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        if flagged:
-            existing_samples.append({
-                "file": rel_path,
-                "reason": reason or "Flagged for revisit",
-                "date": now_str,
-            })
-
-        existing_samples.sort(key=lambda s: s["file"])
-        revisit_data = {
-            "count": len(existing_samples),
-            "updated": now_str,
-            "samples": existing_samples,
-        }
-
-        atomic_write_json(REVISIT_JSON_PATH, revisit_data)
-
-        # Write clean plain text list for agents/human reading
-        txt_lines = [
-            "# Samplepack Revisit List",
-            "# Format: <file> | <reason> | <date>",
-            f"# Total flagged: {len(existing_samples)} (Updated {now_str})",
-            "",
-        ]
-        for s in existing_samples:
-            txt_lines.append(f"{s['file']} | {s.get('reason', '')} | {s.get('date', '')}")
-        REVISIT_TXT_PATH.write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
-
-        # Also update catalog.json for that entry
-        catalog = read_catalog()
-        for s in catalog.get("samples", []):
-            if s.get("file") == rel_path:
-                s["revisit"] = flagged
-                s["revisit_reason"] = reason if flagged else None
-                s["revisit_date"] = now_str if flagged else None
-                if flagged:
-                    s["reviewed"] = False
-                    s["reviewed_date"] = None
-                break
-        atomic_write_json(CATALOG_PATH, catalog)
-
-        return {
-            "ok": True,
-            "file": rel_path,
-            "flagged": flagged,
-            "reason": reason,
-            "count": len(existing_samples),
-            "samples": existing_samples,
-            "reviewed": False if flagged else None,
-        }
+                fields[field_name] = payload.decode(charset)
+            except (LookupError, UnicodeDecodeError):
+                raise APIError(f"invalid text field encoding: {field_name}") from None
+    if upload is None:
+        raise APIError("choose a WAV file to upload")
+    return fields, upload
 
 
-def get_reviewed_list() -> dict:
-    catalog = read_catalog()
-    samples = catalog.get("samples", [])
-    reviewed = [
-        {
-            "file": s.get("file"),
-            "name": s.get("name"),
-            "reviewed_date": s.get("reviewed_date"),
-        }
-        for s in samples
-        if s.get("reviewed")
-    ]
+def add_sample(fields: dict[str, str], upload: tuple[str, bytes]) -> dict[str, Any]:
+    category = validate_category(fields.get("category"))
+    name = clean_text(fields.get("name"), "name", required=True)
+    role = clean_text(fields.get("role"), "role", required=True)
+    original_name, audio_bytes = upload
+    if not original_name.casefold().endswith(".wav"):
+        raise APIError("select a .wav audio file")
+    stats = analyze_uploaded_wav(audio_bytes)
+    stem = slugify(PurePosixPath(original_name.replace("\\", "/")).stem) or slugify(name) or "sample"
+    file_name = catalog_db.normalize_file(f"{category}/{stem}.wav")
+    _, destination = sample_path(file_name, must_exist=False)
+    tags = clean_tags(fields.get("tags"))
+    suggested_use = clean_text(fields.get("suggested_use"), "suggested_use")
+    transcript = clean_text(fields.get("transcript"), "transcript")
+    description = clean_text(fields.get("description"), "description")
+    license_text = clean_text(fields.get("license"), "license") or "Unknown — verify rights before distribution"
+    uses = [role]
+    if suggested_use:
+        uses.extend(slugify(item) for item in TAG_SPLIT_RE.split(suggested_use) if slugify(item))
+    sample = {
+        "file": file_name,
+        "name": name,
+        "category": category,
+        "tags": tags,
+        **stats,
+        "dry_processed": "processed",
+        "parent": None,
+        "processing": ["local library import"],
+        "provenance": {"type": "local_import", "original_filename": PurePosixPath(original_name.replace("\\", "/")).name,
+                       "license": license_text},
+        "license": license_text,
+        "description": description,
+        "source_window": None,
+        "role": role,
+        "use": sorted(set(uses)),
+        "suggested_use": suggested_use,
+        "transcript": transcript or None,
+        "reviewed": False,
+        "reviewed_date": None,
+        "revisit": True,
+        "revisit_reason": "New import: verify source, license, and audio quality",
+        "revisit_date": catalog_db.now_string(),
+    }
+    with MUTATION_LOCK:
+        if destination.exists() or catalog_db.get_sample(file_name) is not None:
+            raise APIError(f"a sample already exists at {file_name}", status=409)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{stem}.", suffix=".wav", dir=destination.parent)
+        os.close(fd)
+        temporary = Path(temporary_name)
+        try:
+            atomic_write_bytes(temporary, audio_bytes)
+            if transcript:
+                write_wav_uslt(temporary, transcript)
+            os.replace(temporary, destination)
+            try:
+                catalog_db.add_sample(sample)
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+        finally:
+            temporary.unlink(missing_ok=True)
+    return catalog_db.get_sample(file_name) or sample
+
+
+def set_reviewed(payload: dict[str, Any]) -> dict[str, Any]:
+    relative = catalog_db.normalize_file(payload.get("file"))
+    reviewed = bool(payload.get("reviewed", True))
+    try:
+        sample = catalog_db.set_state(relative, reviewed=reviewed)
+    except KeyError:
+        raise APIError(f"sample not found in catalog: {relative}", status=404) from None
+    cat = catalog_db.load_catalog()
     return {
-        "ok": True,
-        "count": len(reviewed),
-        "total": len(samples),
-        "samples": reviewed,
+        "ok": True, "file": relative, "reviewed": reviewed,
+        "reviewed_date": sample.get("reviewed_date"),
+        "reviewed_count": sum(bool(s.get("reviewed")) for s in cat["samples"]),
+        "revisit_count": sum(bool(s.get("revisit")) for s in cat["samples"]),
+        "sample": sample,
     }
 
 
-def set_reviewed(payload: dict) -> dict:
-    rel_path = validate_rel_file(payload.get("file"))
-    reviewed = bool(payload.get("reviewed", True))
-    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+def set_revisit(payload: dict[str, Any]) -> dict[str, Any]:
+    relative = catalog_db.normalize_file(payload.get("file"))
+    flagged = bool(payload.get("flagged", True))
+    reason = clean_text(payload.get("reason"), "reason")
+    try:
+        sample = catalog_db.set_state(relative, flagged=flagged, reason=reason)
+    except KeyError:
+        raise APIError(f"sample not found in catalog: {relative}", status=404) from None
+    flagged_samples = [s for s in catalog_db.load_catalog()["samples"] if s.get("revisit")]
+    return {
+        "ok": True, "file": relative, "flagged": flagged,
+        "reason": sample.get("revisit_reason"), "count": len(flagged_samples),
+        "samples": [{"file": s["file"], "reason": s.get("revisit_reason"), "date": s.get("revisit_date")} for s in flagged_samples],
+        "reviewed": sample.get("reviewed"),
+    }
 
-    with MUTATION_LOCK:
-        catalog = read_catalog()
-        samples = catalog.get("samples", [])
-        target = None
-        for s in samples:
-            if s.get("file") == rel_path:
-                target = s
-                s["reviewed"] = reviewed
-                s["reviewed_date"] = now_str if reviewed else None
-                if reviewed and s.get("revisit"):
-                    s["revisit"] = False
-                    s["revisit_reason"] = None
-                    s["revisit_date"] = None
-                break
 
-        if target is None:
-            raise EditError(f"sample not found in catalog.json: {rel_path}", status=404)
-
-        if reviewed:
-            prune_revisit(rel_path)
-
-        reviewed_count = sum(1 for s in samples if s.get("reviewed"))
-        revisit_count = sum(1 for s in samples if s.get("revisit"))
-        atomic_write_json(CATALOG_PATH, catalog)
-
-        return {
-            "ok": True,
-            "file": rel_path,
-            "reviewed": reviewed,
-            "reviewed_date": target.get("reviewed_date"),
-            "reviewed_count": reviewed_count,
-            "revisit_count": revisit_count,
-            "sample": target,
-        }
+def _read_body(handler: SimpleHTTPRequestHandler, limit: int) -> bytes:
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        raise APIError("invalid Content-Length") from None
+    if length <= 0:
+        raise APIError("request body is required")
+    if length > limit:
+        raise APIError("request body is too large", status=413)
+    return handler.rfile.read(length)
 
 
 class SamplepackHandler(SimpleHTTPRequestHandler):
-    server_version = "SamplepackHTTP/1.0"
+    server_version = "SamplepackHTTP/2.0"
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=str(PACK_DIR), **kwargs)
 
-    def do_GET(self) -> None:  # noqa: N802 (http.server API)
-        route = self.path.split("?", 1)[0]
-        if route == "/api/revisit":
-            self._send_json(get_revisit_list(), status=200)
-            return
-        if route in ("/api/review", "/api/approve"):
-            self._send_json(get_reviewed_list(), status=200)
-            return
-        super().do_GET()
+    def do_GET(self) -> None:  # noqa: N802
+        route = urlsplit(self.path).path
+        if route in ("/api/catalog", "/catalog.json"):
+            self._send_json(catalog_db.load_catalog())
+        elif route == "/api/revisit":
+            samples = [s for s in catalog_db.load_catalog()["samples"] if s.get("revisit")]
+            self._send_json({"ok": True, "count": len(samples), "samples": [
+                {"file": s["file"], "reason": s.get("revisit_reason"), "date": s.get("revisit_date")} for s in samples
+            ]})
+        elif route in ("/api/review", "/api/approve"):
+            samples = [s for s in catalog_db.load_catalog()["samples"] if s.get("reviewed")]
+            self._send_json({"ok": True, "count": len(samples), "total": catalog_db.load_catalog()["count"], "samples": [
+                {"file": s["file"], "name": s.get("name"), "reviewed_date": s.get("reviewed_date")} for s in samples
+            ]})
+        elif route == "/api/favorites":
+            self._send_json({"ok": True, "files": catalog_db.list_favorites()})
+        elif route == "/mcp":
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif route.startswith("/api/"):
+            self._send_json({"ok": False, "error": "not found"}, status=404)
+        elif route.startswith("/catalog.sqlite3"):
+            self.send_error(404)
+        else:
+            self._serve_static(route)
 
-    def do_POST(self) -> None:  # noqa: N802 (http.server API)
-        route = self.path.split("?", 1)[0]
-        if route == "/api/edit":
-            self._handle_edit()
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._serve_static(urlsplit(self.path).path, head_only=True)
+
+    def do_POST(self) -> None:  # noqa: N802
+        route = urlsplit(self.path).path
+        try:
+            self._guard_mutation(route)
+        except APIError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=exc.status)
             return
-        if route == "/api/delete":
-            self._handle_delete()
-            return
-        if route in ("/api/revisit", "/api/flag"):
-            self._handle_revisit()
-            return
-        if route in ("/api/review", "/api/approve"):
-            self._handle_review()
+        if route == "/mcp":
+            self._handle_mcp()
             return
         if route == "/api/shutdown":
             self._handle_shutdown()
             return
-        self._send_json({"ok": False, "error": "not found"}, status=404)
-
-    def _handle_review(self) -> None:
+        if route == "/api/add":
+            self._handle_add()
+            return
         try:
-            payload = self._read_json_body()
-            result = set_reviewed(payload)
-        except (DeleteError, EditError) as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=getattr(exc, "status", 400))
-            return
+            payload = self._read_json()
+            if route in ("/api/edit", "/api/sample"):
+                result = {"ok": True, "sample": edit_sample(payload), "count": catalog_db.load_catalog()["count"]}
+            elif route == "/api/delete":
+                result = delete_sample(payload.get("file"))
+            elif route in ("/api/revisit", "/api/flag"):
+                result = set_revisit(payload)
+            elif route in ("/api/review", "/api/approve"):
+                result = set_reviewed(payload)
+            elif route == "/api/favorite":
+                relative = catalog_db.normalize_file(payload.get("file"))
+                try:
+                    sample = catalog_db.set_state(relative, favorite=bool(payload.get("favorite", True)))
+                except KeyError:
+                    raise APIError(f"sample not found in catalog: {relative}", status=404) from None
+                result = {"ok": True, "file": relative, "favorite": sample["favorite"]}
+            elif route == "/api/favorites/import":
+                files = payload.get("files", [])
+                if not isinstance(files, list):
+                    raise APIError("'files' must be a list")
+                result = {"ok": True, "files": catalog_db.set_favorites(files, merge=True)}
+            else:
+                self._send_json({"ok": False, "error": "not found"}, status=404)
+                return
+            self._send_json(result)
+        except APIError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=exc.status)
+        except (ValueError, KeyError, FileExistsError) as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
+            self.log_error("request failed: %s", exc)
             self._send_json({"ok": False, "error": f"server error: {exc}"}, status=500)
-            return
-        self._send_json(result)
 
-    def _handle_revisit(self) -> None:
+    def do_PUT(self) -> None:  # noqa: N802
+        if urlsplit(self.path).path != "/api/sample":
+            self._send_json({"ok": False, "error": "not found"}, status=404)
+            return
+        self.do_POST()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        route = urlsplit(self.path).path
+        if route != "/api/sample":
+            self._send_json({"ok": False, "error": "not found"}, status=404)
+            return
         try:
-            payload = self._read_json_body()
-            result = toggle_revisit(payload)
-        except (DeleteError, EditError) as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=getattr(exc, "status", 400))
-            return
-        except Exception as exc:
-            self._send_json({"ok": False, "error": f"server error: {exc}"}, status=500)
-            return
-        self._send_json(result)
+            self._guard_mutation(route)
+            self._send_json(delete_sample(self._read_json().get("file")))
+        except APIError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=exc.status)
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+    def _guard_mutation(self, route: str) -> None:
+        origin = self.headers.get("Origin")
+        if origin is not None and not self._same_origin(origin):
+            raise APIError("cross-origin requests are not allowed", status=403)
+        if route in JSON_MUTATION_ROUTES:
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                raise APIError("Content-Type must be application/json", status=415)
+
+    def _same_origin(self, origin: str) -> bool:
+        parts = urlsplit(origin.strip())
+        if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+            return False
+        if parts.username is not None or parts.password is not None:
+            return False
+        host = self.headers.get("Host", "").strip()
+        return bool(host) and parts.netloc.casefold() == host.casefold()
 
     def _handle_shutdown(self) -> None:
-        self._send_json({"ok": True, "message": "Server shutting down..."}, status=200)
-        server = self.server
-        shutdown_cb = getattr(server, "shutdown_callback", None)
+        self._send_json({"ok": True, "message": "Server shutting down..."})
+        callback = getattr(self.server, "shutdown_callback", None)
+        shutdown = callback if callable(callback) else self.server.shutdown
+        threading.Thread(target=shutdown, daemon=True).start()
 
-        def _do_shutdown() -> None:
-            if callable(shutdown_cb):
-                try:
-                    shutdown_cb()
-                except Exception:
-                    pass
-            try:
-                server.shutdown()
-            except Exception:
-                pass
-
-        threading.Thread(target=_do_shutdown, name="api-shutdown", daemon=True).start()
-
-    def do_PUT(self) -> None:  # noqa: N802 (http.server API)
-        if self.path.split("?", 1)[0] != "/api/sample":
-            self._send_json({"ok": False, "error": "not found"}, status=404)
-            return
-        self._handle_edit()
-
-    def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
-        if self.path.split("?", 1)[0] != "/api/sample":
-            self._send_json({"ok": False, "error": "not found"}, status=404)
-            return
-        self._handle_delete()
-
-    def _handle_edit(self) -> None:
+    def _serve_static(self, route: str, *, head_only: bool = False) -> None:
         try:
-            payload = self._read_json_body()
-            result = edit_sample(payload)
-        except EditError as exc:
+            target = static_file(route)
+        except APIError as exc:
+            self.send_error(exc.status, str(exc))
+            return
+        if target is None:
+            self.send_error(404)
+            return
+        try:
+            size = target.stat().st_size
+        except OSError:
+            self.send_error(404)
+            return
+        content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if head_only:
+            return
+        try:
+            with target.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile)
+        except OSError:
+            pass
+
+    def _handle_add(self) -> None:
+        try:
+            body = _read_body(self, MAX_UPLOAD_BYTES)
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data;"):
+                raise APIError("upload must use multipart/form-data")
+            fields, upload = _decode_multipart(content_type, body)
+            sample = add_sample(fields, upload)
+            self._send_json({"ok": True, "sample": sample, "count": catalog_db.load_catalog()["count"]}, status=201)
+        except APIError as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=exc.status)
-            return
-        except Exception as exc:  # keep the API contract even on surprises
-            self.log_error("edit failed: %s", exc)
-            self._send_json({"ok": False, "error": f"edit failed: {exc}"}, status=500)
-            return
-        self._send_json(result, status=200)
+        except Exception as exc:
+            self.log_error("sample upload failed: %s", exc)
+            self._send_json({"ok": False, "error": f"upload failed: {exc}"}, status=500)
 
-    def _handle_delete(self) -> None:
-        try:
-            payload = self._read_json_body()
-            result = delete_sample(payload.get("file"))
-        except DeleteError as exc:
-            self._send_json({"ok": False, "error": str(exc)}, status=exc.status)
+    def _handle_mcp(self) -> None:
+        accept = self.headers.get("Accept", "")
+        if "application/json" not in accept and "text/event-stream" not in accept:
+            self.send_error(406, "Accept must include application/json or text/event-stream")
             return
-        except Exception as exc:  # keep the API contract even on surprises
-            self.log_error("delete failed: %s", exc)
-            self._send_json({"ok": False, "error": f"delete failed: {exc}"}, status=500)
+        version = self.headers.get("MCP-Protocol-Version")
+        if version and version not in mcp_protocol.SUPPORTED_PROTOCOLS:
+            self.send_error(400, "unsupported MCP protocol version")
             return
-        self._send_json(result, status=200)
-
-    def _read_json_body(self) -> dict:
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            raise DeleteError("invalid Content-Length") from None
-        if length <= 0:
-            raise DeleteError("JSON body is required")
-        if length > MAX_BODY_BYTES:
-            raise DeleteError("JSON body is too large", status=413)
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw.decode("utf-8"))
+            raw = _read_body(self, MAX_BODY_BYTES)
+            message = json.loads(raw.decode("utf-8"))
+            response = mcp_protocol.handle_message(message)
+            if response is None:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send_json(response, content_type="application/json; charset=utf-8")
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DeleteError(f"invalid JSON body: {exc}") from None
-        if not isinstance(body, dict):
-            raise DeleteError("JSON body must be an object")
-        return body
+            self._send_json({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32700, "message": f"Parse error: {exc}"}}, status=400)
+        except APIError as exc:
+            self._send_json({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32600, "message": str(exc)}}, status=exc.status)
+        except Exception as exc:
+            self.log_error("MCP request failed: %s", exc)
+            self._send_json({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32603, "message": "Internal MCP error"}}, status=500)
 
-    def _send_json(self, data: dict, status: int = 200) -> None:
-        body = (json.dumps(data) + "\n").encode("utf-8")
+    def _read_json(self) -> dict[str, Any]:
+        try:
+            raw = _read_body(self, MAX_BODY_BYTES)
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise APIError(f"invalid JSON body: {exc}") from None
+        if not isinstance(value, dict):
+            raise APIError("JSON body must be an object")
+        return value
+
+    def _send_json(self, value: Any, status: int = 200,
+                   content_type: str = "application/json; charset=utf-8") -> None:
+        body = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1065,6 +740,8 @@ class SamplepackServer(ThreadingHTTPServer):
 
 
 def main() -> int:
+    import sys
+
     port = 12012
     if len(sys.argv) > 1:
         try:
@@ -1072,9 +749,11 @@ def main() -> int:
         except ValueError:
             print(f"invalid port: {sys.argv[1]}", file=sys.stderr)
             return 2
-
+    catalog_db.migrate_legacy_files()
+    catalog_db.generate_indexes()
     with SamplepackServer(("127.0.0.1", port), SamplepackHandler) as httpd:
         print(f"Serving samplepack from {PACK_DIR} at http://127.0.0.1:{port}/")
+        print(f"MCP endpoint: http://127.0.0.1:{port}/mcp")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

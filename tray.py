@@ -30,6 +30,7 @@ except ImportError as exc:
     sys.exit(1)
 
 from server import PACK_DIR, SamplepackHandler, SamplepackServer
+import catalog_db
 
 APP_TITLE = "Samplepack Browser"
 DEFAULT_PORT = 12012
@@ -82,7 +83,7 @@ def create_tray_icon_image(size: int = 64) -> Image.Image:
 def is_server_already_running(port: int) -> bool:
     """Check if our samplepack server is already serving on this port."""
     try:
-        url = f"http://127.0.0.1:{port}/catalog.json"
+        url = f"http://127.0.0.1:{port}/api/catalog"
         req = urllib.request.Request(url, headers={"User-Agent": "SamplepackTrayCheck"})
         with urllib.request.urlopen(req, timeout=1.2) as resp:
             return resp.status == 200
@@ -141,6 +142,8 @@ class SamplepackTrayController:
         self._is_shutting_down = False
 
     def start_server(self) -> bool:
+        catalog_db.migrate_legacy_files()
+        catalog_db.generate_indexes()
         if is_server_already_running(self.port):
             notify(
                 "Samplepack Browser already active",
